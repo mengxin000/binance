@@ -1,0 +1,7 @@
+{
+  "sample_interval_ms": 200,
+  "display_refresh_seconds": 1.0,
+  "stale_seconds": 10.0,
+  "persist_interval_seconds": 60.0,
+  "data_directory": "data"
+}
