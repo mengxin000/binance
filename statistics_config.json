@@ -1,7 +1,7 @@
 {
   "min_samples": 300,
   "min_four_sigma_bps": 3.0,
-  "expansion_threshold_bps": 5.0,
-  "quantile_sample_size": 7200,
+  "expansion_threshold_bps": 7.0,
+  "quantile_sample_size": 90000,
   "bbo_record_interval_ms": 1000
 }

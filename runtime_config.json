@@ -1,7 +1,8 @@
 {
-  "sample_interval_ms": 200,
+  "sample_interval_ms": 500,
   "display_refresh_seconds": 1.0,
   "stale_seconds": 10.0,
   "persist_interval_seconds": 60.0,
-  "data_directory": "data"
+  "data_directory": "data",
+  "bbo_queue_maxsize": 20000
 }

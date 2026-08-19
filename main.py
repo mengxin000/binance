@@ -35,6 +35,7 @@ class FilterConfig:
     positive_basis_only: bool = True
     min_spot_price: float = 0.1
     quote_assets: tuple[str, ...] = ("USDT",)
+    cross_quote_pairings: tuple[tuple[str, str], ...] = ()
 
     def validate(self) -> None:
         if self.min_spot_volume < 0 or self.min_futures_volume < 0:
@@ -49,6 +50,18 @@ class FilterConfig:
             raise ValueError("quote_assets 必须是非空数组")
         if any(not isinstance(asset, str) or not asset.isupper() for asset in self.quote_assets):
             raise ValueError("quote_assets 必须是大写报价币种字符串")
+        if not isinstance(self.cross_quote_pairings, (list, tuple)):
+            raise ValueError("cross_quote_pairings 必须是数组")
+        for pairing in self.cross_quote_pairings:
+            if (
+                not isinstance(pairing, (list, tuple))
+                or len(pairing) != 2
+                or any(not isinstance(asset, str) or not asset.isupper() for asset in pairing)
+                or pairing[0] == pairing[1]
+            ):
+                raise ValueError(
+                    "cross_quote_pairings 每项必须是两个不同的大写报价币种，顺序为[现货, 永续]"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +92,7 @@ class RuntimeConfig:
     stale_seconds: float = 2.0
     persist_interval_seconds: float = 60.0
     data_directory: str = "data"
+    bbo_queue_maxsize: int = 20_000
 
     def validate(self) -> None:
         if not isinstance(self.sample_interval_ms, int) or self.sample_interval_ms < 50:
@@ -87,6 +101,8 @@ class RuntimeConfig:
             raise ValueError("显示刷新和行情过期时间必须大于 0")
         if self.persist_interval_seconds <= 0 or not self.data_directory.strip():
             raise ValueError("持久化间隔必须大于 0，数据目录不能为空")
+        if not isinstance(self.bbo_queue_maxsize, int) or self.bbo_queue_maxsize < 100:
+            raise ValueError("bbo_queue_maxsize 必须是至少为 100 的整数")
 
 
 ConfigT = TypeVar("ConfigT")
@@ -149,11 +165,16 @@ class PairSnapshot:
     spot_mid: float
     futures_mid: float
     basis_bps: float
+    spot_symbol: str = ""
+    futures_symbol: str = ""
+    conversion_rate: float = 1.0
 
 
 @dataclass(slots=True)
 class BboSnapshot:
     symbol: str
+    spot_symbol: str
+    futures_symbol: str
     source_market: str
     timestamp: float
     spot_bid: float
@@ -162,6 +183,9 @@ class BboSnapshot:
     futures_ask: float
     spot_received_at: float
     futures_received_at: float
+    conversion_rate: float = 1.0
+    conversion_symbol: str = ""
+    conversion_received_at: float = 0.0
 
     @property
     def spot_mid(self) -> float:
@@ -169,6 +193,10 @@ class BboSnapshot:
 
     @property
     def futures_mid(self) -> float:
+        return (self.futures_bid + self.futures_ask) / 2 * self.conversion_rate
+
+    @property
+    def raw_futures_mid(self) -> float:
         return (self.futures_bid + self.futures_ask) / 2
 
     @property
@@ -176,15 +204,38 @@ class BboSnapshot:
         return (self.futures_mid / self.spot_mid - 1) * 10_000
 
 
+@dataclass(frozen=True, slots=True)
+class PairRoute:
+    key: str
+    base_asset: str
+    spot_symbol: str
+    futures_symbol: str
+    spot_quote: str
+    futures_quote: str
+    conversion_symbol: str = ""
+    conversion_inverted: bool = False
+
+    @property
+    def label(self) -> str:
+        if self.spot_symbol == self.futures_symbol:
+            return self.spot_symbol
+        return f"{self.spot_symbol}/{self.futures_symbol}"
+
+
 # 显示状态栏
 class MarketState:
-    def __init__(self) -> None:
+    def __init__(self, bbo_queue_maxsize: int = 20_000) -> None:
         self.quote_assets: frozenset[str] = frozenset({"USDT"})
+        self.cross_quote_pairings: tuple[tuple[str, str], ...] = ()
         self.spot_volumes: dict[str, VolumeTicker] = {}
         self.futures_volumes: dict[str, VolumeTicker] = {}
         self.spot_books: dict[str, BookQuote] = {}
         self.futures_books: dict[str, BookQuote] = {}
-        self.bbo_updates: asyncio.Queue[BboSnapshot] = asyncio.Queue()
+        self.active_routes: dict[str, PairRoute] = {}
+        self.bbo_updates: asyncio.Queue[BboSnapshot] = asyncio.Queue(
+            maxsize=bbo_queue_maxsize
+        )
+        self.bbo_dropped = 0
         self.ticker_connected = {"spot": False, "futures": False}
         self.book_connected = {"spot": False, "futures": False}
         self.ticker_last_update = {"spot": 0.0, "futures": 0.0}
@@ -219,39 +270,165 @@ class MarketState:
         destination = self.spot_books if market == "spot" else self.futures_books
         destination[symbol] = BookQuote(bid, ask, now)
         self.book_last_update[market] = now
-        spot = self.spot_books.get(symbol)
-        futures = self.futures_books.get(symbol)
-        if spot and futures:
-            self.bbo_updates.put_nowait(BboSnapshot(
-                symbol, market, time.time(), spot.bid, spot.ask,
-                futures.bid, futures.ask, spot.received_at, futures.received_at,
-            ))
+        routes = list(self.active_routes.values())
+        if not routes:
+            # 保留同名配对的直接用法，正式运行时订阅前会建立 active_routes。
+            spot = self.spot_books.get(symbol)
+            futures = self.futures_books.get(symbol)
+            if spot and futures:
+                routes = [PairRoute(symbol, symbol, symbol, symbol, "", "")]
+        for route in routes:
+            relevant = (
+                (market == "spot" and symbol in {route.spot_symbol, route.conversion_symbol})
+                or (market == "futures" and symbol == route.futures_symbol)
+            )
+            if not relevant:
+                continue
+            snapshot = self._bbo_snapshot(route, market)
+            if snapshot is not None:
+                self._enqueue_bbo(snapshot)
 
-    def common_symbols(self) -> set[str]:
-        return {
-            symbol for symbol in self.spot_volumes.keys() & self.futures_volumes.keys()
-            if self.is_allowed_symbol(symbol)
-        }
+    def _enqueue_bbo(self, snapshot: BboSnapshot) -> None:
+        if self.bbo_updates.full():
+            try:
+                self.bbo_updates.get_nowait()
+                self.bbo_dropped += 1
+            except asyncio.QueueEmpty:
+                pass
+        self.bbo_updates.put_nowait(snapshot)
+
+    def _split_symbol(self, symbol: str) -> tuple[str, str] | None:
+        for quote in sorted(self.quote_assets, key=len, reverse=True):
+            if symbol.endswith(quote) and len(symbol) > len(quote):
+                return symbol[:-len(quote)], quote
+        return None
+
+    def _conversion_for(
+        self, futures_quote: str, spot_quote: str
+    ) -> tuple[str, bool] | None:
+        if futures_quote == spot_quote:
+            return "", False
+        direct = futures_quote + spot_quote
+        if direct in self.spot_volumes:
+            return direct, False
+        inverse = spot_quote + futures_quote
+        if inverse in self.spot_volumes:
+            return inverse, True
+        return None
+
+    def pair_routes(self, filters: FilterConfig) -> dict[str, PairRoute]:
+        spot_by_asset: dict[tuple[str, str], str] = {}
+        futures_by_asset: dict[tuple[str, str], str] = {}
+        for symbol in self.spot_volumes:
+            parsed = self._split_symbol(symbol)
+            if parsed:
+                spot_by_asset[parsed] = symbol
+        for symbol in self.futures_volumes:
+            parsed = self._split_symbol(symbol)
+            if parsed:
+                futures_by_asset[parsed] = symbol
+
+        pairings = [(asset, asset) for asset in filters.quote_assets]
+        pairings.extend(tuple(pairing) for pairing in filters.cross_quote_pairings)
+        routes: dict[str, PairRoute] = {}
+        for spot_quote, futures_quote in pairings:
+            conversion = self._conversion_for(futures_quote, spot_quote)
+            if conversion is None:
+                continue
+            conversion_symbol, inverted = conversion
+            spot_bases = {
+                base for base, quote in spot_by_asset if quote == spot_quote
+            }
+            futures_bases = {
+                base for base, quote in futures_by_asset if quote == futures_quote
+            }
+            for base in spot_bases & futures_bases:
+                spot_symbol = spot_by_asset[(base, spot_quote)]
+                futures_symbol = futures_by_asset[(base, futures_quote)]
+                key = (
+                    spot_symbol if spot_symbol == futures_symbol
+                    else f"{spot_symbol}__{futures_symbol}"
+                )
+                routes[key] = PairRoute(
+                    key, base, spot_symbol, futures_symbol,
+                    spot_quote, futures_quote, conversion_symbol, inverted,
+                )
+        return routes
+
+    def common_symbols(self, filters: FilterConfig | None = None) -> set[str]:
+        filters = filters or FilterConfig(
+            quote_assets=tuple(sorted(self.quote_assets)),
+            cross_quote_pairings=self.cross_quote_pairings,
+        )
+        return set(self.pair_routes(filters))
+
+    def set_pairing_config(self, filters: FilterConfig) -> None:
+        cross = tuple(tuple(pairing) for pairing in filters.cross_quote_pairings)
+        assets = set(filters.quote_assets)
+        for spot_quote, futures_quote in cross:
+            assets.update((spot_quote, futures_quote))
+        self.quote_assets = frozenset(assets)
+        self.cross_quote_pairings = cross
 
     def set_quote_assets(self, quote_assets: tuple[str, ...] | list[str]) -> None:
         self.quote_assets = frozenset(quote_assets)
+        self.cross_quote_pairings = ()
 
     def is_allowed_symbol(self, symbol: str) -> bool:
         return any(symbol.endswith(asset) for asset in self.quote_assets)
 
-    def liquid_symbols(self, filters: FilterConfig) -> set[str]:
+    def liquid_routes(self, filters: FilterConfig) -> dict[str, PairRoute]:
         return {
-            symbol
-            for symbol in self.common_symbols()
-            if self.spot_volumes[symbol].quote_volume >= filters.min_spot_volume
-            and self.futures_volumes[symbol].quote_volume >= filters.min_futures_volume
+            key: route
+            for key, route in self.pair_routes(filters).items()
+            if self.spot_volumes[route.spot_symbol].quote_volume >= filters.min_spot_volume
+            and self.futures_volumes[route.futures_symbol].quote_volume >= filters.min_futures_volume
         }
+
+    def liquid_symbols(self, filters: FilterConfig) -> set[str]:
+        return set(self.liquid_routes(filters))
+
+    def book_symbols(self, market: str, filters: FilterConfig) -> set[str]:
+        routes = self.liquid_routes(filters)
+        self.active_routes = routes
+        if market == "futures":
+            return {route.futures_symbol for route in routes.values()}
+        symbols = {route.spot_symbol for route in routes.values()}
+        symbols.update(
+            route.conversion_symbol for route in routes.values()
+            if route.conversion_symbol
+        )
+        return symbols
+
+    def _conversion_rate(self, route: PairRoute) -> tuple[float, float] | None:
+        if not route.conversion_symbol:
+            return 1.0, 0.0
+        quote = self.spot_books.get(route.conversion_symbol)
+        if quote is None or quote.mid <= 0:
+            return None
+        rate = 1 / quote.mid if route.conversion_inverted else quote.mid
+        return rate, quote.received_at
+
+    def _bbo_snapshot(self, route: PairRoute, source_market: str) -> BboSnapshot | None:
+        spot = self.spot_books.get(route.spot_symbol)
+        futures = self.futures_books.get(route.futures_symbol)
+        conversion = self._conversion_rate(route)
+        if spot is None or futures is None or conversion is None:
+            return None
+        rate, conversion_received_at = conversion
+        return BboSnapshot(
+            route.key, route.spot_symbol, route.futures_symbol,
+            source_market, time.time(), spot.bid, spot.ask,
+            futures.bid, futures.ask, spot.received_at, futures.received_at,
+            rate, route.conversion_symbol, conversion_received_at,
+        )
 
     def eligible_symbols(self, filters: FilterConfig) -> set[str]:
         return {
-            symbol for symbol in self.liquid_symbols(filters)
-            if (spot := self.spot_books.get(symbol)) is not None
+            key for key, route in self.liquid_routes(filters).items()
+            if (spot := self.spot_books.get(route.spot_symbol)) is not None
             and spot.mid > filters.min_spot_price
+            and self._conversion_rate(route) is not None
         }
 
     def streams_healthy(self, stale_seconds: float) -> bool:
@@ -266,27 +443,63 @@ class MarketState:
             return []
         now = time.monotonic()
         result: list[PairSnapshot] = []
-        for symbol in self.eligible_symbols(filters):
-            spot = self.spot_books.get(symbol)
-            futures = self.futures_books.get(symbol)
-            if not spot or not futures:
+        routes = self.liquid_routes(filters)
+        for key in self.eligible_symbols(filters):
+            route = routes[key]
+            spot = self.spot_books.get(route.spot_symbol)
+            futures = self.futures_books.get(route.futures_symbol)
+            conversion = self._conversion_rate(route)
+            if not spot or not futures or conversion is None:
                 continue
-            if now - spot.received_at > stale_seconds or now - futures.received_at > stale_seconds:
+            rate, conversion_received_at = conversion
+            ages = [now - spot.received_at, now - futures.received_at]
+            if route.conversion_symbol:
+                ages.append(now - conversion_received_at)
+            if max(ages) > stale_seconds:
                 continue
-            spot_mid, futures_mid = spot.mid, futures.mid
+            spot_mid, futures_mid = spot.mid, futures.mid * rate
             result.append(PairSnapshot(
-                symbol, spot_mid, futures_mid,
+                key, spot_mid, futures_mid,
                 (futures_mid / spot_mid - 1) * 10_000,
+                route.spot_symbol, route.futures_symbol, rate,
             ))
         return result
 
-    def quote_age(self, symbol: str) -> float | None:
-        spot = self.spot_books.get(symbol)
-        futures = self.futures_books.get(symbol)
-        if not spot or not futures:
+    def quote_age(self, symbol: str, filters: FilterConfig | None = None) -> float | None:
+        filters = filters or FilterConfig(
+            quote_assets=tuple(sorted(self.quote_assets)),
+            cross_quote_pairings=self.cross_quote_pairings,
+        )
+        route = self.pair_routes(filters).get(symbol)
+        if route is None:
             return None
+        spot = self.spot_books.get(route.spot_symbol)
+        futures = self.futures_books.get(route.futures_symbol)
+        conversion = self._conversion_rate(route)
+        if not spot or not futures or conversion is None:
+            return None
+        _, conversion_received_at = conversion
         now = time.monotonic()
-        return max(now - spot.received_at, now - futures.received_at)
+        ages = [now - spot.received_at, now - futures.received_at]
+        if route.conversion_symbol:
+            ages.append(now - conversion_received_at)
+        return max(ages)
+
+    def route(self, symbol: str, filters: FilterConfig) -> PairRoute | None:
+        return self.pair_routes(filters).get(symbol)
+
+    def pair_label(self, symbol: str, filters: FilterConfig) -> str:
+        route = self.route(symbol, filters)
+        return route.label if route else symbol
+
+    def pair_volumes(self, symbol: str, filters: FilterConfig) -> tuple[float, float]:
+        route = self.route(symbol, filters)
+        if route is None:
+            return 0.0, 0.0
+        return (
+            self.spot_volumes[route.spot_symbol].quote_volume,
+            self.futures_volumes[route.futures_symbol].quote_volume,
+        )
 
 
 @dataclass(slots=True)
@@ -380,8 +593,11 @@ class PairStatistics:
                 self.armed = False
                 opportunity = {
                     "time": datetime.fromtimestamp(now_wall, timezone.utc).isoformat(),
+                    "spot_symbol": snapshot.spot_symbol or snapshot.symbol,
+                    "futures_symbol": snapshot.futures_symbol or snapshot.symbol,
                     "spot_mid": snapshot.spot_mid,
                     "futures_mid": snapshot.futures_mid,
+                    "conversion_rate": snapshot.conversion_rate,
                     "mean_basis_bps": previous_mean,
                     "standard_deviation_bps": previous_sigma,
                     "upper_four_sigma_bps": previous_mean + 4 * previous_sigma,
@@ -579,7 +795,7 @@ async def consume_books(
     error_key = f"{market}_book"
     delay = 1.0
     while not stop.is_set():
-        symbols = state.liquid_symbols(filter_manager.current)
+        symbols = state.book_symbols(market, filter_manager.current)
         if not symbols:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=1)
@@ -602,7 +818,7 @@ async def consume_books(
                     if isinstance(row, dict):
                         state.update_book(market, row)
                     if time.monotonic() - last_check >= 10:
-                        if state.liquid_symbols(filter_manager.current) != symbols:
+                        if state.book_symbols(market, filter_manager.current) != symbols:
                             break
                         last_check = time.monotonic()
         except asyncio.CancelledError:
@@ -650,6 +866,11 @@ async def process_bbo_updates(
                 continue
             if now_mono - bbo.spot_received_at > stale_seconds or now_mono - bbo.futures_received_at > stale_seconds:
                 continue
+            if (
+                bbo.conversion_symbol
+                and now_mono - bbo.conversion_received_at > stale_seconds
+            ):
+                continue
             stats = engine.pairs.setdefault(bbo.symbol, PairStatistics(bbo.symbol))
             basis_bps = bbo.basis_bps
             stats.update_bbo_range(basis_bps, config.quantile_sample_size)
@@ -665,11 +886,16 @@ async def process_bbo_updates(
             records.append((bbo.symbol, {
                 "time": datetime.fromtimestamp(bbo.timestamp, timezone.utc).isoformat(),
                 "source_market": bbo.source_market,
+                "spot_symbol": bbo.spot_symbol,
+                "futures_symbol": bbo.futures_symbol,
+                "conversion_symbol": bbo.conversion_symbol or None,
+                "conversion_rate": bbo.conversion_rate,
                 "spot_bid": bbo.spot_bid,
                 "spot_ask": bbo.spot_ask,
                 "spot_mid": bbo.spot_mid,
                 "futures_bid": bbo.futures_bid,
                 "futures_ask": bbo.futures_ask,
+                "raw_futures_mid": bbo.raw_futures_mid,
                 "futures_mid": bbo.futures_mid,
                 "mean_basis_bps": stats.mean_basis_bps,
                 "standard_deviation_bps": stats.standard_deviation_bps,
@@ -744,7 +970,7 @@ def render(
     rows = [
         stats for stats in rows
         if stats.symbol in state.eligible_symbols(filters)
-        and (age := state.quote_age(stats.symbol)) is not None
+        and (age := state.quote_age(stats.symbol, filters)) is not None
         and age <= runtime.stale_seconds
     ]
     warming = sum(stats.sample_count < stats_config.min_samples for stats in engine.pairs.values())
@@ -754,7 +980,7 @@ def render(
         f"永续 {'在线' if state.ticker_connected['futures'] else '重连中'} | "
         f"盘口流: 现货 {'在线' if state.book_connected['spot'] else '重连中'} / "
         f"永续 {'在线' if state.book_connected['futures'] else '重连中'}",
-        f"报价币种: {','.join(filters.quote_assets)} | 共同交易对: {len(state.common_symbols())} | "
+        f"报价币种: {','.join(sorted(state.quote_assets))} | 配对路线: {len(state.common_symbols(filters))} | "
         f"成交额达标: {len(state.liquid_symbols(filters))} | "
         f"价格达标: {len(state.eligible_symbols(filters))} | "
         f"入选统计: {len(rows)} | 正基差筛选: {'开启' if filters.positive_basis_only else '关闭'} | "
@@ -763,6 +989,8 @@ def render(
         f"初筛: 4σ > {stats_config.min_four_sigma_bps:g}bp | "
         f"扩差阈值: 当前基差上穿 μ+{stats_config.expansion_threshold_bps:g}bp | "
         "复位: 回落至 μ",
+        f"BBO队列: {state.bbo_updates.qsize()}/{state.bbo_updates.maxsize} | "
+        f"已丢弃旧快照: {state.bbo_dropped}",
         f"市场准入: 现货中间价 > {filters.min_spot_price:g} USDT/USDC",
     ]
     for message in config_errors:
@@ -770,7 +998,7 @@ def render(
     for key, message in state.errors.items():
         if message:
             lines.append(f"{key} 错误: {message}")
-    widths = [3, 12, 13, 13, 16, 10, 21, 21, 21, 11, 10, 10, 10, 11]
+    widths = [3, 21, 13, 13, 16, 10, 21, 21, 21, 11, 10, 10, 10, 11]
     aligns = [
         "right", "left", "right", "right", "right", "right",
         "right", "right", "right", "right", "right", "right",
@@ -782,7 +1010,7 @@ def render(
         "【基差机会统计】",
         separator,
         table_row(
-            ["#", "交易对", "现货成交额", "永续成交额", "现货价格", "μ基差", "P5～P95范围", "本次运行范围", "μ±4σ范围", "当前基差", "当前位置", "行情年龄", "扩差次数", "最近扩差"],
+            ["#", "现货/永续", "现货成交额", "永续成交额", "现货价格", "μ基差", "P5～P95范围", "本次运行范围", "μ±4σ范围", "当前基差", "当前位置", "行情年龄", "扩差次数", "最近扩差"],
             widths, aligns,
         ),
         separator,
@@ -799,11 +1027,12 @@ def render(
             runtime_text = (
                 f"{runtime_range[0]:+.2f}～{runtime_range[1]:+.2f}bp" if runtime_range else "--"
             )
-            quote_age = state.quote_age(stats.symbol)
+            quote_age = state.quote_age(stats.symbol, filters)
+            spot_volume, futures_volume = state.pair_volumes(stats.symbol, filters)
             lines.append(table_row([
-                str(index), stats.symbol,
-                format_quote_volume(state.spot_volumes[stats.symbol].quote_volume),
-                format_quote_volume(state.futures_volumes[stats.symbol].quote_volume),
+                str(index), state.pair_label(stats.symbol, filters),
+                format_quote_volume(spot_volume),
+                format_quote_volume(futures_volume),
                 f"{stats.current_spot_mid:.8g}",
                 f"{stats.mean_basis_bps:+.2f}bp",
                 quantile_text, runtime_text, range_four, f"{stats.current_basis_bps:+.2f}bp",
@@ -818,7 +1047,7 @@ def render(
         )
     lines += [
         separator,
-        "基差 = (永续bookTicker中间价 / 现货bookTicker中间价 - 1) × 10000；μ与σ使用在线增量算法。",
+        "基差 = (折算后永续中间价 / 现货中间价 - 1) × 10000；跨报价币种使用USDCUSDT现货中间价折算。",
     ]
     return "\n".join(lines)
 
@@ -834,8 +1063,9 @@ async def run() -> None:
     runtime_manager = ConfigManager(RUNTIME_CONFIG_PATH, RuntimeConfig)
     store = PairDirectoryStore(resolve_path(runtime_manager.current.data_directory))
     engine = StatisticsEngine(store.load())
-    state, stop = MarketState(), asyncio.Event()
-    state.set_quote_assets(filter_manager.current.quote_assets)
+    state = MarketState(runtime_manager.current.bbo_queue_maxsize)
+    stop = asyncio.Event()
+    state.set_pairing_config(filter_manager.current)
     # 记录启动时间，time.monotonic()单增计数1，2，3...
     started_mono = time.monotonic()
     loop = asyncio.get_running_loop()
@@ -857,11 +1087,17 @@ async def run() -> None:
     next_sample = time.monotonic()
     try:
         while not stop.is_set():
+            for task in tasks:
+                if task.done():
+                    exception = task.exception()
+                    if exception is not None:
+                        raise RuntimeError("后台任务异常退出") from exception
+                    raise RuntimeError("后台任务意外停止")
             filter_manager.reload()
             statistics_manager.reload()
             runtime_manager.reload()
             filters = filter_manager.current
-            state.set_quote_assets(filters.quote_assets)
+            state.set_pairing_config(filters)
             stats_config = statistics_manager.current
             runtime = runtime_manager.current
             sample_interval = runtime.sample_interval_ms / 1000

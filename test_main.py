@@ -18,6 +18,18 @@ from main import (
 
 
 class PairStatisticsTests(unittest.TestCase):
+    def test_bbo_queue_drops_oldest_snapshot_when_full(self):
+        state = MarketState(bbo_queue_maxsize=2)
+        for market in ("spot", "futures"):
+            state.update_book(market, {"s": "BTCUSDT", "b": "100", "a": "102"})
+        state.update_book("spot", {"s": "BTCUSDT", "b": "101", "a": "103"})
+        state.update_book("futures", {"s": "BTCUSDT", "b": "102", "a": "104"})
+
+        self.assertEqual(state.bbo_updates.qsize(), 2)
+        self.assertEqual(state.bbo_dropped, 1)
+        snapshots = [state.bbo_updates.get_nowait(), state.bbo_updates.get_nowait()]
+        self.assertEqual(snapshots[-1].spot_mid, 102.0)
+
     def test_online_mean(self):
         stats = PairStatistics("AAAUSDT")
         config = StatisticsConfig(min_samples=2)
@@ -94,6 +106,46 @@ class PairDirectoryStoreTests(unittest.TestCase):
 
 
 class MarketStateTests(unittest.TestCase):
+    def test_cross_quote_pairings_are_normalized_with_usdcusdt_mid(self):
+        filters = FilterConfig(
+            min_spot_volume=0,
+            min_futures_volume=0,
+            quote_assets=("USDT", "USDC"),
+            cross_quote_pairings=(("USDT", "USDC"), ("USDC", "USDT")),
+        )
+        state = MarketState()
+        state.set_pairing_config(filters)
+        state.update_tickers("spot", [
+            {"s": "BTCUSDT", "q": "20000000"},
+            {"s": "BTCUSDC", "q": "20000000"},
+            {"s": "USDCUSDT", "q": "20000000"},
+        ])
+        state.update_tickers("futures", [
+            {"s": "BTCUSDT", "q": "20000000"},
+            {"s": "BTCUSDC", "q": "20000000"},
+        ])
+        state.book_symbols("spot", filters)
+        state.book_symbols("futures", filters)
+        books = [
+            ("spot", "BTCUSDT", 100_000),
+            ("spot", "BTCUSDC", 100_100),
+            ("spot", "USDCUSDT", 0.999),
+            ("futures", "BTCUSDT", 100_000),
+            ("futures", "BTCUSDC", 100_100),
+        ]
+        for market, symbol, price in books:
+            state.update_book(market, {"s": symbol, "b": str(price), "a": str(price)})
+        state.ticker_connected = {"spot": True, "futures": True}
+        state.book_connected = {"spot": True, "futures": True}
+
+        rows = {row.symbol: row for row in state.snapshots(filters, 10)}
+        usdt_spot = rows["BTCUSDT__BTCUSDC"]
+        usdc_spot = rows["BTCUSDC__BTCUSDT"]
+        self.assertAlmostEqual(usdt_spot.futures_mid, 100_100 * 0.999)
+        self.assertAlmostEqual(usdc_spot.futures_mid, 100_000 / 0.999)
+        self.assertEqual(usdt_spot.spot_symbol, "BTCUSDT")
+        self.assertEqual(usdt_spot.futures_symbol, "BTCUSDC")
+
     def test_quote_assets_only_match_same_quote_currency(self):
         state = MarketState()
         state.set_quote_assets(["USDT", "USDC"])
