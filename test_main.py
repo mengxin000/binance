@@ -10,6 +10,7 @@ from main import (
     MarketState,
     PairSnapshot,
     PairStatistics,
+    StatisticsEngine,
     StatisticsConfig,
     format_quote_volume,
     table_row,
@@ -32,45 +33,52 @@ class PairStatisticsTests(unittest.TestCase):
 
     def test_online_mean(self):
         stats = PairStatistics("AAAUSDT")
-        config = StatisticsConfig(min_samples=2)
+        config = StatisticsConfig(
+            total_window_samples=3, long_window_samples=3,
+            short_window_samples=2, open_threshold_bps=100,
+            close_threshold_bps=-100,
+        )
         for index, basis in enumerate((2.0, 4.0, 6.0)):
             stats.update(PairSnapshot("AAAUSDT", 100, 100, basis), 1000 + index, 0.2, config)
         self.assertEqual(stats.sample_count, 3)
         self.assertAlmostEqual(stats.mean_basis_bps, 4.0)
         self.assertAlmostEqual(stats.standard_deviation_bps, (8 / 3) ** 0.5)
         self.assertAlmostEqual(stats.observed_seconds, 0.6)
+        stats.update(PairSnapshot("AAAUSDT", 100, 100, 8.0), 1004, 0.2, config)
+        self.assertEqual(list(stats.basis_samples), [4.0, 6.0, 8.0])
+        self.assertAlmostEqual(stats.mean_basis_bps, 6.0)
 
-    def test_opportunity_counts_once_until_rearmed(self):
+    def test_open_and_close_excursions_are_counted_independently(self):
         stats = PairStatistics("AAAUSDT")
         config = StatisticsConfig(
-            min_samples=2, min_four_sigma_bps=0.1,
-            expansion_threshold_bps=0.1, quantile_sample_size=20,
+            total_window_samples=100, long_window_samples=50,
+            short_window_samples=20, open_threshold_bps=5,
+            close_threshold_bps=-5,
         )
-        for index, basis in enumerate((0, 2, 4, 5, 1, 10)):
+        events = []
+        for index, basis in enumerate((0, 8, 0, -8, 0)):
+            events.extend(
             stats.update(PairSnapshot("AAAUSDT", 100, 100, float(basis)), 1000 + index, 0.2, config)
-        self.assertEqual(stats.opportunity_count, 2)
-        self.assertFalse(stats.armed)
+            )
+        self.assertEqual(stats.open_count, 1)
+        self.assertEqual(stats.close_count, 1)
+        self.assertEqual([event["event"] for event in events], [
+            "open_opportunity", "close_opportunity",
+        ])
 
-    def test_bbo_quantiles_keep_only_configured_recent_sample_count(self):
+    def test_quantiles_use_truncated_tail_of_total_window(self):
         stats = PairStatistics("AAAUSDT")
+        config = StatisticsConfig(
+            total_window_samples=5, long_window_samples=4,
+            short_window_samples=3, open_threshold_bps=100,
+            close_threshold_bps=-100,
+        )
         for basis in range(10):
-            stats.update_bbo_range(float(basis), sample_size=5)
-        self.assertEqual(list(stats.quantile_samples), [5.0, 6.0, 7.0, 8.0, 9.0])
-        self.assertEqual(stats.runtime_range, (0.0, 9.0))
-        low, high = stats.quantile_range() or (None, None)
-        self.assertAlmostEqual(low, 5.2)
-        self.assertAlmostEqual(high, 8.8)
-
-    def test_expansion_threshold_is_independent_from_four_sigma_screen(self):
-        stats = PairStatistics("AAAUSDT")
-        config = StatisticsConfig(
-            min_samples=2, min_four_sigma_bps=0.1,
-            expansion_threshold_bps=100, quantile_sample_size=20,
-        )
-        for index, basis in enumerate((0, 2, 20)):
-            stats.update(PairSnapshot("AAAUSDT", 100, 100, float(basis)), 1000 + index, 0.2, config)
-        self.assertGreater(stats.four_sigma_bps, config.min_four_sigma_bps)
-        self.assertEqual(stats.opportunity_count, 0)
+            stats.update(PairSnapshot("AAAUSDT", 100, 100, float(basis)), 1000 + basis, 0.2, config)
+        self.assertEqual(list(stats.basis_samples), [5.0, 6.0, 7.0, 8.0, 9.0])
+        self.assertEqual(stats.runtime_range, (5.0, 9.0))
+        low, high = stats.quantile_range(3, 0.0, 1.0) or (None, None)
+        self.assertEqual((low, high), (7.0, 9.0))
 
     def test_bbo_record_rate_limit_is_per_pair(self):
         stats = PairStatistics("AAAUSDT")
@@ -78,28 +86,45 @@ class PairStatisticsTests(unittest.TestCase):
         self.assertFalse(stats.allow_bbo_record(1000.999, 1.0))
         self.assertTrue(stats.allow_bbo_record(1001.0, 1.0))
 
+    def test_ranking_uses_smaller_open_close_count_first(self):
+        config = StatisticsConfig(
+            total_window_samples=10, long_window_samples=8,
+            short_window_samples=3, min_k_sigma_bps=0.1,
+        )
+        engine = StatisticsEngine()
+        for symbol in ("AAAUSDT", "BBBUSDT"):
+            stats = PairStatistics(symbol)
+            stats.update(PairSnapshot(symbol, 100, 100, 0), 1000, 0.2, config)
+            stats.update(PairSnapshot(symbol, 100, 100, 2), 1001, 0.2, config)
+            engine.pairs[symbol] = stats
+        engine.pairs["AAAUSDT"].open_count = 100
+        engine.pairs["AAAUSDT"].close_count = 2
+        engine.pairs["BBBUSDT"].open_count = 20
+        engine.pairs["BBBUSDT"].close_count = 18
+        rows = engine.selected_rows(False, config)
+        self.assertEqual([row.symbol for row in rows], ["BBBUSDT", "AAAUSDT"])
+
 
 class PairDirectoryStoreTests(unittest.TestCase):
     def test_save_state_and_append_only_opportunity(self):
         with tempfile.TemporaryDirectory() as directory:
             store = PairDirectoryStore(Path(directory))
-            stats = PairStatistics(
-                "AAAUSDT", sample_count=10, observed_seconds=2,
-                mean_basis_bps=3.5, basis_m2=90, current_basis_bps=4,
-                current_deviation_bps=0.5, opportunity_count=2,
-                last_opportunity_at=999, armed=False,
+            stats = PairStatistics("AAAUSDT", open_count=2, close_count=1)
+            config = StatisticsConfig(
+                total_window_samples=5, long_window_samples=4,
+                short_window_samples=3,
             )
+            stats.update(PairSnapshot("AAAUSDT", 100, 101, 3.5), 1000, 0.2, config)
             store.save_states([stats])
-            stats.opportunity_count = 3
+            stats.open_count = 3
             store.save_states([stats])
             event = {"timestamp": 1001, "basis_bps": 8, "deviation_bps": 5}
             store.append_opportunity("AAAUSDT", event)
-            restored = store.load()["AAAUSDT"]
-            self.assertEqual(restored.opportunity_count, 3)
-            self.assertAlmostEqual(restored.mean_basis_bps, 3.5)
-            self.assertFalse(restored.armed)
+            self.assertEqual(store.load(), {})
             state = json.loads((Path(directory) / "AAAUSDT" / "state.json").read_text())
             self.assertNotIn("record_type", state)
+            self.assertEqual(state["open_count"], 3)
+            self.assertEqual(state["close_count"], 1)
             lines = (Path(directory) / "AAAUSDT" / "opportunities.jsonl").read_text().splitlines()
             self.assertEqual(len(lines), 1)
             self.assertEqual(json.loads(lines[0]), event)

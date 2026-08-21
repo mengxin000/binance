@@ -1,5 +1,5 @@
 {
-  "sample_interval_ms": 500,
+  "sample_interval_ms": 1000,
   "display_refresh_seconds": 1.0,
   "stale_seconds": 10.0,
   "persist_interval_seconds": 60.0,

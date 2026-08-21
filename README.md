@@ -23,15 +23,16 @@ basis_bps = (normalized_futures_mid / BTCUSDT spot_mid - 1) × 10000
 
 反方向 `BTCUSDC` 现货与 `BTCUSDT` 永续使用除法折算。转换盘口也受行情新鲜度检查；转换价格过期时不产生样本。
 
-bookTicker 持续更新内存报价；统计循环每200ms读取一次双方最新mid，因此每个交易对每秒最多形成5个同步基差样本。
+bookTicker 持续更新内存报价；统计循环每200ms读取一次双方最新mid，因此每个交易路线每秒最多形成5个固定频率样本。BBO推送频率不会改变滑动统计的样本权重。
 
-基差均值与标准差使用 Welford 在线增量算法，不需要把全部样本保存在内存。
+每条路线只维护一个总样本滑动队列。μ、σ和运行范围使用总队列；长窗、短窗分别截取总队列尾部指定数量的样本计算P5～P95。窗口未装满时直接使用已有样本，不设置覆盖率或预热门槛。
 
 ```text
-new_mean = old_mean + (current_basis - old_mean) / new_sample_count
+μ = rolling_sum / current_sample_count
+σ² = rolling_sum_of_squares / current_sample_count - μ²
 ```
 
-`min_four_sigma_bps` 是研究初筛：只有 `4σ` 大于该值才进入榜单。`expansion_threshold_bps` 是独立的事件阈值：当前基差上穿 `μ + expansion_threshold_bps` 时记录一次扩差；回落至 `μ` 后复位。分位数范围使用最近 `quantile_sample_size` 个BBO基差样本的 P5～P95。
+`sigma_multiplier × σ` 仍然是研究初筛。开仓机会与平仓机会是两个独立往返事件：基差达到上阈值后回落至μ记一次开仓机会；达到下阈值后回升至μ记一次平仓机会。排序首先使用 `min(开仓机会, 平仓机会)`，然后使用两者总数。
 
 ## 配置
 
@@ -58,13 +59,20 @@ new_mean = old_mean + (current_basis - old_mean) / new_sample_count
 
 ```json
 {
-  "min_samples": 300,
-  "min_four_sigma_bps": 5.0,
-  "expansion_threshold_bps": 5.0,
-  "quantile_sample_size": 3600,
+  "total_window_samples": 432000,
+  "long_window_samples": 144000,
+  "short_window_samples": 54000,
+  "quantile_low": 0.05,
+  "quantile_high": 0.95,
+  "sigma_multiplier": 2.0,
+  "min_k_sigma_bps": 3.0,
+  "open_threshold_bps": 7.0,
+  "close_threshold_bps": -5.0,
   "bbo_record_interval_ms": 1000
 }
 ```
+
+三个窗口样本数、分位数、k值和上下事件阈值均支持热加载。必须满足 `short_window_samples <= long_window_samples <= total_window_samples`。
 
 `runtime_config.json`：
 
@@ -98,13 +106,13 @@ data/
     opportunities.jsonl
 ```
 
-`state.json` 每60秒覆盖一次，保存采样数、统计时长、基差均值、方差累计量、当前基差和扩差次数等恢复状态。启动时读取该文件继续累计。
+`state.json` 每60秒覆盖一次，只保存当前统计摘要供查看。滑动样本队列不会持久化，程序启动后从空窗口重新统计，也不会从旧的 `state.json` 恢复。
 
 同币种路线继续使用原交易对作为目录名；跨币种路线使用 `现货交易对__永续交易对`，因此四种路线的统计互不混合。
 
-`opportunities.jsonl` 只在基差向上穿越事件阈值时追加一行，记录当时的现货中间价、永续中间价、μ、σ、当前基差、偏离和扩差序号。没有扩差时不会创建或写入该文件。
+`opportunities.jsonl` 在完整的上侧或下侧往返事件完成时追加一行，通过 `event` 区分 `open_opportunity` 和 `close_opportunity`。
 
-`bbo_above_threshold.jsonl` 记录每条高于 `μ + expansion_threshold_bps` 的 BBO 推送；该文件位于相同交易对目录中。
+`bbo_above_threshold.jsonl` 记录高于 `μ + open_threshold_bps` 的BBO推送，并受写入间隔限制；该文件位于相同交易对目录中。
 
 终端表格按 Unicode 实际显示宽度补齐，中英文、`μ`、`σ` 与全角范围符号混排时仍保持列对齐。
 

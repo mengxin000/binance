@@ -1,7 +1,7 @@
 {
   "min_spot_volume": 10000000,
   "min_futures_volume": 10000000,
-  "top": 20,
+  "top": 30,
   "positive_basis_only": false,
   "min_spot_price": 0.1,
   "quote_assets": ["USDT", "USDC"],

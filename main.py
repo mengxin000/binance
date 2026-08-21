@@ -66,21 +66,39 @@ class FilterConfig:
 
 @dataclass(frozen=True, slots=True)
 class StatisticsConfig:
-    min_samples: int = 300
-    min_four_sigma_bps: float = 5.0
-    expansion_threshold_bps: float = 5.0
-    quantile_sample_size: int = 3600
+    total_window_samples: int = 432_000
+    long_window_samples: int = 144_000
+    short_window_samples: int = 54_000
+    quantile_low: float = 0.05
+    quantile_high: float = 0.95
+    sigma_multiplier: float = 2.0
+    min_k_sigma_bps: float = 3.0
+    open_threshold_bps: float = 7.0
+    close_threshold_bps: float = -5.0
     bbo_record_interval_ms: int = 1000
 
     def validate(self) -> None:
-        if not isinstance(self.min_samples, int) or self.min_samples < 2:
-            raise ValueError("min_samples 必须是至少为 2 的整数")
-        if self.min_four_sigma_bps <= 0:
-            raise ValueError("min_four_sigma_bps 必须大于 0")
-        if self.expansion_threshold_bps <= 0:
-            raise ValueError("expansion_threshold_bps 必须大于 0")
-        if not isinstance(self.quantile_sample_size, int) or self.quantile_sample_size < 20:
-            raise ValueError("quantile_sample_size 必须是至少为 20 的整数")
+        windows = (
+            self.short_window_samples,
+            self.long_window_samples,
+            self.total_window_samples,
+        )
+        if any(not isinstance(value, int) or value < 2 for value in windows):
+            raise ValueError("三个窗口样本数必须是至少为 2 的整数")
+        if not (
+            self.short_window_samples
+            <= self.long_window_samples
+            <= self.total_window_samples
+        ):
+            raise ValueError("必须满足 short_window_samples <= long_window_samples <= total_window_samples")
+        if not 0 <= self.quantile_low < self.quantile_high <= 1:
+            raise ValueError("分位数必须满足 0 <= quantile_low < quantile_high <= 1")
+        if self.sigma_multiplier <= 0 or self.min_k_sigma_bps <= 0:
+            raise ValueError("sigma_multiplier 和 min_k_sigma_bps 必须大于 0")
+        if self.open_threshold_bps <= 0:
+            raise ValueError("open_threshold_bps 必须大于 0")
+        if self.close_threshold_bps >= 0:
+            raise ValueError("close_threshold_bps 必须小于 0")
         if not isinstance(self.bbo_record_interval_ms, int) or self.bbo_record_interval_ms < 1:
             raise ValueError("bbo_record_interval_ms 必须是至少为 1 的整数")
 
@@ -508,45 +526,42 @@ class PairStatistics:
     sample_count: int = 0
     observed_seconds: float = 0.0
     mean_basis_bps: float = 0.0
-    basis_m2: float = 0.0
+    rolling_sum: float = 0.0
+    rolling_sum_squares: float = 0.0
     current_spot_mid: float = 0.0
     current_basis_bps: float = 0.0
     current_deviation_bps: float = 0.0
-    opportunity_count: int = 0
-    last_opportunity_at: float | None = None
-    armed: bool = True
+    open_count: int = 0
+    close_count: int = 0
+    upper_excursion_active: bool = False
+    lower_excursion_active: bool = False
     last_sample_at: float | None = None
-    runtime_min_basis_bps: float = float("inf")
-    runtime_max_basis_bps: float = float("-inf")
-    quantile_samples: deque[float] = field(default_factory=deque, repr=False)
+    basis_samples: deque[float] = field(default_factory=deque, repr=False)
     last_bbo_record_at: float | None = None
 
     @property
     def standard_deviation_bps(self) -> float:
         if self.sample_count < 2:
             return 0.0
-        return (self.basis_m2 / self.sample_count) ** 0.5
+        variance = self.rolling_sum_squares / self.sample_count - self.mean_basis_bps ** 2
+        return max(0.0, variance) ** 0.5
 
     @property
-    def four_sigma_bps(self) -> float:
-        return 4 * self.standard_deviation_bps
+    def effective_opportunity_count(self) -> int:
+        return min(self.open_count, self.close_count)
 
     @property
     def sigma_position(self) -> float:
         sigma = self.standard_deviation_bps
         return self.current_deviation_bps / sigma if sigma > 0 else 0.0
 
-    def update_bbo_range(self, basis_bps: float, sample_size: int) -> None:
-        self.runtime_min_basis_bps = min(self.runtime_min_basis_bps, basis_bps)
-        self.runtime_max_basis_bps = max(self.runtime_max_basis_bps, basis_bps)
-        self.quantile_samples.append(basis_bps)
-        while len(self.quantile_samples) > sample_size:
-            self.quantile_samples.popleft()
-
-    def quantile_range(self) -> tuple[float, float] | None:
-        if not self.quantile_samples:
+    def quantile_range(
+        self, sample_size: int, low: float, high: float
+    ) -> tuple[float, float] | None:
+        if not self.basis_samples:
             return None
-        values = sorted(self.quantile_samples)
+        count = min(sample_size, self.sample_count)
+        values = sorted(list(self.basis_samples)[-count:])
 
         def percentile(q: float) -> float:
             position = q * (len(values) - 1)
@@ -555,7 +570,7 @@ class PairStatistics:
             weight = position - left
             return values[left] * (1 - weight) + values[right] * weight
 
-        return percentile(0.05), percentile(0.95)
+        return percentile(low), percentile(high)
 
     def allow_bbo_record(self, timestamp: float, interval_seconds: float) -> bool:
         if self.last_bbo_record_at is not None and timestamp - self.last_bbo_record_at < interval_seconds:
@@ -565,9 +580,25 @@ class PairStatistics:
 
     @property
     def runtime_range(self) -> tuple[float, float] | None:
-        if self.runtime_min_basis_bps == float("inf"):
+        if not self.basis_samples:
             return None
-        return self.runtime_min_basis_bps, self.runtime_max_basis_bps
+        return min(self.basis_samples), max(self.basis_samples)
+
+    def resize_window(self, total_window_samples: int) -> None:
+        while len(self.basis_samples) > total_window_samples:
+            removed = self.basis_samples.popleft()
+            self.rolling_sum -= removed
+            self.rolling_sum_squares -= removed * removed
+        self.sample_count = len(self.basis_samples)
+        self.mean_basis_bps = (
+            self.rolling_sum / self.sample_count if self.sample_count else 0.0
+        )
+
+    def _append_sample(self, basis_bps: float, total_window_samples: int) -> None:
+        self.basis_samples.append(basis_bps)
+        self.rolling_sum += basis_bps
+        self.rolling_sum_squares += basis_bps * basis_bps
+        self.resize_window(total_window_samples)
 
     def update(
         self,
@@ -575,7 +606,7 @@ class PairStatistics:
         now_wall: float,
         sample_interval_seconds: float,
         config: StatisticsConfig,
-    ) -> dict[str, Any] | None:
+    ) -> list[dict[str, Any]]:
         current_basis_bps = snapshot.basis_bps
         previous_mean = self.mean_basis_bps
         previous_sigma = self.standard_deviation_bps
@@ -584,14 +615,15 @@ class PairStatistics:
         self.current_deviation_bps = (
             current_basis_bps - previous_mean if self.sample_count else 0.0
         )
-        opportunity: dict[str, Any] | None = None
-        if self.sample_count >= config.min_samples and 4 * previous_sigma > config.min_four_sigma_bps:
-            trigger = config.expansion_threshold_bps
-            if self.armed and self.current_deviation_bps >= trigger:
-                self.opportunity_count += 1
-                self.last_opportunity_at = now_wall
-                self.armed = False
-                opportunity = {
+        events: list[dict[str, Any]] = []
+        if self.sample_count:
+            if not self.upper_excursion_active and self.current_deviation_bps >= config.open_threshold_bps:
+                self.upper_excursion_active = True
+            elif self.upper_excursion_active and self.current_deviation_bps <= 0:
+                self.open_count += 1
+                self.upper_excursion_active = False
+                events.append({
+                    "event": "open_opportunity",
                     "time": datetime.fromtimestamp(now_wall, timezone.utc).isoformat(),
                     "spot_symbol": snapshot.spot_symbol or snapshot.symbol,
                     "futures_symbol": snapshot.futures_symbol or snapshot.symbol,
@@ -600,26 +632,37 @@ class PairStatistics:
                     "conversion_rate": snapshot.conversion_rate,
                     "mean_basis_bps": previous_mean,
                     "standard_deviation_bps": previous_sigma,
-                    "upper_four_sigma_bps": previous_mean + 4 * previous_sigma,
-                    "trigger_basis_bps": previous_mean + config.expansion_threshold_bps,
+                    "trigger_basis_bps": previous_mean + config.open_threshold_bps,
                     "basis_bps": current_basis_bps,
                     "deviation_bps": self.current_deviation_bps,
-                    "opportunity_number": self.opportunity_count,
-                }
-            elif not self.armed and self.current_deviation_bps <= 0:
-                self.armed = True
+                    "opportunity_number": self.open_count,
+                })
 
-        self.sample_count += 1
-        delta = current_basis_bps - self.mean_basis_bps
-        self.mean_basis_bps += delta / self.sample_count
-        self.basis_m2 += delta * (current_basis_bps - self.mean_basis_bps)
+            if not self.lower_excursion_active and self.current_deviation_bps <= config.close_threshold_bps:
+                self.lower_excursion_active = True
+            elif self.lower_excursion_active and self.current_deviation_bps >= 0:
+                self.close_count += 1
+                self.lower_excursion_active = False
+                events.append({
+                    "event": "close_opportunity",
+                    "time": datetime.fromtimestamp(now_wall, timezone.utc).isoformat(),
+                    "spot_symbol": snapshot.spot_symbol or snapshot.symbol,
+                    "futures_symbol": snapshot.futures_symbol or snapshot.symbol,
+                    "spot_mid": snapshot.spot_mid,
+                    "futures_mid": snapshot.futures_mid,
+                    "conversion_rate": snapshot.conversion_rate,
+                    "mean_basis_bps": previous_mean,
+                    "standard_deviation_bps": previous_sigma,
+                    "trigger_basis_bps": previous_mean + config.close_threshold_bps,
+                    "basis_bps": current_basis_bps,
+                    "deviation_bps": self.current_deviation_bps,
+                    "opportunity_number": self.close_count,
+                })
+
+        self._append_sample(current_basis_bps, config.total_window_samples)
         self.observed_seconds += sample_interval_seconds
         self.last_sample_at = now_wall
-        return opportunity
-
-    @property
-    def opportunity_rate_per_hour(self) -> float:
-        return self.opportunity_count / max(self.observed_seconds / 3600, 1 / 3600)
+        return events
 
 
 class PairDirectoryStore:
@@ -630,33 +673,8 @@ class PairDirectoryStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def load(self) -> dict[str, PairStatistics]:
-        latest: dict[str, PairStatistics] = {}
-        for path in self.root.glob("*/state.json"):
-            try:
-                row = json.loads(path.read_text(encoding="utf-8"))
-                symbol = path.parent.name
-                stats = PairStatistics(
-                        symbol=symbol,
-                        sample_count=int(row["sample_count"]),
-                        observed_seconds=float(row["observed_seconds"]),
-                        mean_basis_bps=float(row["mean_basis_bps"]),
-                        basis_m2=float(row["basis_m2"]),
-                        current_spot_mid=float(row.get("current_spot_mid", 0.0)),
-                        current_basis_bps=float(row["current_basis_bps"]),
-                        current_deviation_bps=float(row["current_deviation_bps"]),
-                        opportunity_count=int(row["opportunity_count"]),
-                        last_opportunity_at=(
-                            float(row["last_opportunity_at"])
-                            if row.get("last_opportunity_at") is not None
-                            else None
-                        ),
-                        armed=bool(row["armed"]),
-                        last_sample_at=(float(row["last_sample_at"]) if row.get("last_sample_at") is not None else None),
-                )
-            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-                continue
-            latest[symbol] = stats
-        return latest
+        # 滑动窗口不从 state.json 恢复；每次启动从空窗口重新统计。
+        return {}
 
     def save_states(self, statistics: list[PairStatistics]) -> None:
         for stats in statistics:
@@ -666,14 +684,14 @@ class PairDirectoryStore:
                     "sample_count": stats.sample_count,
                     "observed_seconds": stats.observed_seconds,
                     "mean_basis_bps": stats.mean_basis_bps,
-                    "basis_m2": stats.basis_m2,
                     "standard_deviation_bps": stats.standard_deviation_bps,
                     "current_spot_mid": stats.current_spot_mid,
                     "current_basis_bps": stats.current_basis_bps,
                     "current_deviation_bps": stats.current_deviation_bps,
-                    "opportunity_count": stats.opportunity_count,
-                    "last_opportunity_at": stats.last_opportunity_at,
-                    "armed": stats.armed,
+                    "open_count": stats.open_count,
+                    "close_count": stats.close_count,
+                    "upper_excursion_active": stats.upper_excursion_active,
+                    "lower_excursion_active": stats.lower_excursion_active,
                     "last_sample_at": stats.last_sample_at,
             }
             target = pair_dir / "state.json"
@@ -724,33 +742,38 @@ class StatisticsEngine:
         opportunities: list[tuple[str, dict[str, Any]]] = []
         for snapshot in snapshots:
             stats = self.pairs.setdefault(snapshot.symbol, PairStatistics(snapshot.symbol))
-            opportunity = stats.update(snapshot, now_wall, sample_interval_seconds, config)
-            if opportunity is not None:
+            for opportunity in stats.update(snapshot, now_wall, sample_interval_seconds, config):
                 opportunities.append((snapshot.symbol, opportunity))
         return opportunities
+
+    def resize_windows(self, total_window_samples: int) -> None:
+        for stats in self.pairs.values():
+            stats.resize_window(total_window_samples)
+
     # 筛选交易对
-    def eligible_rows(self, min_samples: int, positive_basis_only: bool) -> list[PairStatistics]:
+    def eligible_rows(self, positive_basis_only: bool) -> list[PairStatistics]:
         return [
             stats for stats in self.pairs.values()
-            if stats.sample_count >= min_samples
+            if stats.sample_count >= 2
             and (not positive_basis_only or stats.mean_basis_bps > 0)
         ]
     # 排序
     def selected_rows(
         self,
-        min_samples: int,
         positive_basis_only: bool,
-        min_four_sigma_bps: float,
+        config: StatisticsConfig,
     ) -> list[PairStatistics]:
         return sorted(
             (
-                stats for stats in self.eligible_rows(min_samples, positive_basis_only)
-                if stats.four_sigma_bps > min_four_sigma_bps
+                stats for stats in self.eligible_rows(positive_basis_only)
+                if config.sigma_multiplier * stats.standard_deviation_bps
+                > config.min_k_sigma_bps
             ),
             key=lambda stats: (
-                stats.opportunity_count,
+                stats.effective_opportunity_count,
+                stats.open_count + stats.close_count,
                 stats.sigma_position,
-                stats.four_sigma_bps,
+                stats.standard_deviation_bps,
             ),
             reverse=True,
         )
@@ -873,10 +896,9 @@ async def process_bbo_updates(
                 continue
             stats = engine.pairs.setdefault(bbo.symbol, PairStatistics(bbo.symbol))
             basis_bps = bbo.basis_bps
-            stats.update_bbo_range(basis_bps, config.quantile_sample_size)
-            if stats.sample_count < config.min_samples:
+            if stats.sample_count < 1:
                 continue
-            trigger_basis_bps = stats.mean_basis_bps + config.expansion_threshold_bps
+            trigger_basis_bps = stats.mean_basis_bps + config.open_threshold_bps
             if basis_bps <= trigger_basis_bps:
                 continue
             if not stats.allow_bbo_record(
@@ -961,19 +983,13 @@ def render(
     started_mono: float,
     config_errors: list[str],
 ) -> str:
-    now_wall = time.time()
-    rows = engine.selected_rows(
-        stats_config.min_samples,
-        filters.positive_basis_only,
-        stats_config.min_four_sigma_bps,
-    )
+    rows = engine.selected_rows(filters.positive_basis_only, stats_config)
     rows = [
         stats for stats in rows
         if stats.symbol in state.eligible_symbols(filters)
         and (age := state.quote_age(stats.symbol, filters)) is not None
         and age <= runtime.stale_seconds
     ]
-    warming = sum(stats.sample_count < stats_config.min_samples for stats in engine.pairs.values())
     lines = [
         "Binance 现货－USDT/USDC-M 永续基差波动筛选",
         f"成交额流: 现货 {'在线' if state.ticker_connected['spot'] else '重连中'} / "
@@ -984,11 +1000,12 @@ def render(
         f"成交额达标: {len(state.liquid_symbols(filters))} | "
         f"价格达标: {len(state.eligible_symbols(filters))} | "
         f"入选统计: {len(rows)} | 正基差筛选: {'开启' if filters.positive_basis_only else '关闭'} | "
-        f"预热中: {warming} | "
         f"采样周期: {runtime.sample_interval_ms}ms | 本次运行: {format_duration(time.monotonic() - started_mono)}",
-        f"初筛: 4σ > {stats_config.min_four_sigma_bps:g}bp | "
-        f"扩差阈值: 当前基差上穿 μ+{stats_config.expansion_threshold_bps:g}bp | "
-        "复位: 回落至 μ",
+        f"样本窗口: 总{stats_config.total_window_samples} / 长{stats_config.long_window_samples} / "
+        f"短{stats_config.short_window_samples} | "
+        f"初筛: {stats_config.sigma_multiplier:g}σ > {stats_config.min_k_sigma_bps:g}bp",
+        f"开仓机会: 上穿 μ+{stats_config.open_threshold_bps:g}bp 后回落至 μ | "
+        f"平仓机会: 下穿 μ{stats_config.close_threshold_bps:+g}bp 后回升至 μ",
         f"BBO队列: {state.bbo_updates.qsize()}/{state.bbo_updates.maxsize} | "
         f"已丢弃旧快照: {state.bbo_dropped}",
         f"市场准入: 现货中间价 > {filters.min_spot_price:g} USDT/USDC",
@@ -998,11 +1015,14 @@ def render(
     for key, message in state.errors.items():
         if message:
             lines.append(f"{key} 错误: {message}")
-    widths = [3, 21, 13, 13, 16, 10, 21, 21, 21, 11, 10, 10, 10, 11]
+    quantile_name = (
+        f"P{stats_config.quantile_low * 100:g}～P{stats_config.quantile_high * 100:g}"
+    )
+    widths = [3, 21, 13, 13, 16, 10, 12, 21, 21, 21, 11, 10, 10, 10, 10]
     aligns = [
         "right", "left", "right", "right", "right", "right",
         "right", "right", "right", "right", "right", "right",
-        "right", "right",
+        "right", "right", "right",
     ]
     separator = "-" * (sum(widths) + 2 * (len(widths) - 1))
     lines += [
@@ -1010,7 +1030,7 @@ def render(
         "【基差机会统计】",
         separator,
         table_row(
-            ["#", "现货/永续", "现货成交额", "永续成交额", "现货价格", "μ基差", "P5～P95范围", "本次运行范围", "μ±4σ范围", "当前基差", "当前位置", "行情年龄", "扩差次数", "最近扩差"],
+            ["#", "现货/永续", "现货成交额", "永续成交额", "现货价格", "μ", "μ+kσ", f"{quantile_name}短窗", f"{quantile_name}长窗", "运行范围", "当前价差", "当前位置", "行情年龄", "开仓机会", "平仓机会"],
             widths, aligns,
         ),
         separator,
@@ -1018,11 +1038,25 @@ def render(
     if rows:
         for index, stats in enumerate(rows[: filters.top], 1):
             sigma = stats.standard_deviation_bps
-            range_four = f"{stats.mean_basis_bps - 4*sigma:+.2f}～{stats.mean_basis_bps + 4*sigma:+.2f}bp"
-            quantiles = stats.quantile_range()
+            upper_sigma = stats.mean_basis_bps + stats_config.sigma_multiplier * sigma
+            short_quantiles = stats.quantile_range(
+                stats_config.short_window_samples,
+                stats_config.quantile_low,
+                stats_config.quantile_high,
+            )
+            long_quantiles = stats.quantile_range(
+                stats_config.long_window_samples,
+                stats_config.quantile_low,
+                stats_config.quantile_high,
+            )
             runtime_range = stats.runtime_range
-            quantile_text = (
-                f"{quantiles[0]:+.2f}～{quantiles[1]:+.2f}bp" if quantiles else "--"
+            short_text = (
+                f"{short_quantiles[0]:+.2f}～{short_quantiles[1]:+.2f}bp"
+                if short_quantiles else "--"
+            )
+            long_text = (
+                f"{long_quantiles[0]:+.2f}～{long_quantiles[1]:+.2f}bp"
+                if long_quantiles else "--"
             )
             runtime_text = (
                 f"{runtime_range[0]:+.2f}～{runtime_range[1]:+.2f}bp" if runtime_range else "--"
@@ -1035,15 +1069,15 @@ def render(
                 format_quote_volume(futures_volume),
                 f"{stats.current_spot_mid:.8g}",
                 f"{stats.mean_basis_bps:+.2f}bp",
-                quantile_text, runtime_text, range_four, f"{stats.current_basis_bps:+.2f}bp",
+                f"{upper_sigma:+.2f}bp", short_text, long_text, runtime_text,
+                f"{stats.current_basis_bps:+.2f}bp",
                 f"{stats.sigma_position:+.2f}σ", f"{quote_age:.1f}秒",
-                f"{stats.opportunity_count}次",
-                format_time_ago(stats.last_opportunity_at, now_wall),
+                f"{stats.open_count}次", f"{stats.close_count}次",
             ], widths, aligns))
     else:
         lines.append(
-            f"暂无交易对满足初筛：至少 {stats_config.min_samples} 个样本且 4σ > "
-            f"{stats_config.min_four_sigma_bps:g}bp。"
+            f"暂无交易对满足初筛：{stats_config.sigma_multiplier:g}σ > "
+            f"{stats_config.min_k_sigma_bps:g}bp。"
         )
     lines += [
         separator,
@@ -1099,6 +1133,7 @@ async def run() -> None:
             filters = filter_manager.current
             state.set_pairing_config(filters)
             stats_config = statistics_manager.current
+            engine.resize_windows(stats_config.total_window_samples)
             runtime = runtime_manager.current
             sample_interval = runtime.sample_interval_ms / 1000
             now_mono = time.monotonic()
@@ -1110,7 +1145,7 @@ async def run() -> None:
                     store.append_opportunity(symbol, opportunity)
 
             if now_mono - last_persist >= runtime.persist_interval_seconds:
-                store.save_states(engine.eligible_rows(stats_config.min_samples, filters.positive_basis_only))
+                store.save_states(engine.eligible_rows(filters.positive_basis_only))
                 last_persist = now_mono
             if now_mono - last_display >= runtime.display_refresh_seconds:
                 errors = [
@@ -1136,10 +1171,7 @@ async def run() -> None:
                 pass
     finally:
         stop.set()
-        store.save_states(engine.eligible_rows(
-            statistics_manager.current.min_samples,
-            filter_manager.current.positive_basis_only,
-        ))
+        store.save_states(engine.eligible_rows(filter_manager.current.positive_basis_only))
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
