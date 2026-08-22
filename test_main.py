@@ -171,6 +171,41 @@ class MarketStateTests(unittest.TestCase):
         self.assertEqual(usdt_spot.spot_symbol, "BTCUSDT")
         self.assertEqual(usdt_spot.futures_symbol, "BTCUSDC")
 
+    def test_usdt_and_usdc_perpetuals_are_paired_by_base_asset(self):
+        filters = FilterConfig(
+            min_futures_volume=0,
+            quote_assets=("USDT", "USDC"),
+        )
+        state = MarketState()
+        state.set_pairing_config(filters)
+        state.update_tickers("spot", [
+            {"s": "USDCUSDT", "q": "20000000"},
+        ])
+        state.update_tickers("futures", [
+            {"s": "BTCUSDT", "q": "30000000"},
+            {"s": "BTCUSDC", "q": "25000000"},
+            {"s": "ETHUSDT", "q": "30000000"},
+        ])
+        self.assertEqual(
+            set(state.futures_futures_routes(filters)),
+            {"BTCUSDT__BTCUSDC"},
+        )
+        state.book_symbols("spot", filters)
+        state.book_symbols("futures", filters)
+        for market, symbol, price in (
+            ("spot", "USDCUSDT", 0.999),
+            ("futures", "BTCUSDT", 100_000),
+            ("futures", "BTCUSDC", 100_100),
+        ):
+            state.update_book(market, {"s": symbol, "b": str(price), "a": str(price)})
+        state.ticker_connected = {"spot": True, "futures": True}
+        state.book_connected = {"spot": True, "futures": True}
+        rows = state.futures_futures_snapshots(filters, 10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].symbol, "BTCUSDT__BTCUSDC")
+        self.assertAlmostEqual(rows[0].spot_mid, 100_000)
+        self.assertAlmostEqual(rows[0].futures_mid, 100_100 * 0.999)
+
     def test_quote_assets_only_match_same_quote_currency(self):
         state = MarketState()
         state.set_quote_assets(["USDT", "USDC"])

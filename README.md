@@ -2,7 +2,7 @@
 
 从 Binance 现货与 USDT-M 永续全市场中筛选流动性达标且基差波动空间足够的交易对。可选正基差条件；程序只统计，不需要 API Key、不下单，也不估算收益。
 
-直接在 Python IDE 中运行 `main.py`。需要长期运行时启动 `guardian.py`；主程序异常退出后，守护程序会等待3秒并自动重启，按 Ctrl+C 可同时停止。
+直接在 Python IDE 中运行 `main.py`。需要长期运行时启动 `guardian.py`；主程序异常退出后，守护程序会等待3秒并自动重启，按 Ctrl+C 可同时停止。运行期间按 `K` 在“现货－永续”和“USDT永续－USDC永续”两个独立页面之间切换。
 
 ## 数据口径
 
@@ -74,6 +74,13 @@ bookTicker 持续更新内存报价；统计循环每200ms读取一次双方最�
 
 三个窗口样本数、分位数、k值和上下事件阈值均支持热加载。必须满足 `short_window_samples <= long_window_samples <= total_window_samples`。
 
+`futures_futures_statistics_config.json` 使用相同字段，独立控制USDT永续－USDC永续页面；两套参数、滑动样本、机会计数和排名互不影响。期货间价差统一定义为：
+
+```text
+USDC永续折算价 = USDC永续mid × USDCUSDT现货mid
+spread_bps = (USDC永续折算价 / USDT永续mid - 1) × 10000
+```
+
 `runtime_config.json`：
 
 ```json
@@ -95,15 +102,17 @@ bookTicker 持续更新内存报价；统计循环每200ms读取一次双方最�
 
 ```text
 data/
-  BNBUSDT/
-    state.json
-    opportunities.jsonl
-  BTCUSDT__BTCUSDC/
-    state.json
-    opportunities.jsonl
-  WLFIUSDT/
-    state.json
-    opportunities.jsonl
+  spot_futures/
+    BNBUSDT/
+      state.json
+      opportunities.jsonl
+    BTCUSDT__BTCUSDC/
+      state.json
+      opportunities.jsonl
+  futures_futures/
+    BTCUSDT__BTCUSDC/
+      state.json
+      opportunities.jsonl
 ```
 
 `state.json` 每60秒覆盖一次，只保存当前统计摘要供查看。滑动样本队列不会持久化，程序启动后从空窗口重新统计，也不会从旧的 `state.json` 恢复。

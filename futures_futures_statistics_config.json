@@ -1,0 +1,12 @@
+{
+  "total_window_samples": 86400,
+  "long_window_samples": 28800,
+  "short_window_samples": 10800,
+  "quantile_low": 0.05,
+  "quantile_high": 0.95,
+  "sigma_multiplier": 2.0,
+  "min_k_sigma_bps": 3.0,
+  "open_threshold_bps": 7.0,
+  "close_threshold_bps": -5.0,
+  "bbo_record_interval_ms": 1000
+}

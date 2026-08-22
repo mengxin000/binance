@@ -23,6 +23,7 @@ SPOT_BOOK_BASE = "wss://data-stream.binance.vision/stream?streams="
 FUTURES_BOOK_BASE = "wss://fstream.binance.com/public/stream?streams="
 FILTER_CONFIG_PATH = BASE_DIR / "filter_config.json"
 STATISTICS_CONFIG_PATH = BASE_DIR / "statistics_config.json"
+FUTURES_FUTURES_STATISTICS_CONFIG_PATH = BASE_DIR / "futures_futures_statistics_config.json"
 RUNTIME_CONFIG_PATH = BASE_DIR / "runtime_config.json"
 
 
@@ -186,6 +187,7 @@ class PairSnapshot:
     spot_symbol: str = ""
     futures_symbol: str = ""
     conversion_rate: float = 1.0
+    market_type: str = "spot_futures"
 
 
 @dataclass(slots=True)
@@ -238,6 +240,20 @@ class PairRoute:
         if self.spot_symbol == self.futures_symbol:
             return self.spot_symbol
         return f"{self.spot_symbol}/{self.futures_symbol}"
+
+
+@dataclass(frozen=True, slots=True)
+class FuturesFuturesRoute:
+    key: str
+    base_asset: str
+    usdt_symbol: str
+    usdc_symbol: str
+    conversion_symbol: str
+    conversion_inverted: bool = False
+
+    @property
+    def label(self) -> str:
+        return f"{self.usdt_symbol}/{self.usdc_symbol}"
 
 
 # 显示状态栏
@@ -373,6 +389,38 @@ class MarketState:
                 )
         return routes
 
+    def futures_futures_routes(
+        self, filters: FilterConfig
+    ) -> dict[str, FuturesFuturesRoute]:
+        if not {"USDT", "USDC"}.issubset(self.quote_assets):
+            return {}
+        conversion = self._conversion_for("USDC", "USDT")
+        if conversion is None:
+            return {}
+        conversion_symbol, inverted = conversion
+        usdt_by_base: dict[str, str] = {}
+        usdc_by_base: dict[str, str] = {}
+        for symbol in self.futures_volumes:
+            parsed = self._split_symbol(symbol)
+            if not parsed:
+                continue
+            base, quote = parsed
+            if quote == "USDT":
+                usdt_by_base[base] = symbol
+            elif quote == "USDC":
+                usdc_by_base[base] = symbol
+        return {
+            f"{usdt_by_base[base]}__{usdc_by_base[base]}": FuturesFuturesRoute(
+                f"{usdt_by_base[base]}__{usdc_by_base[base]}",
+                base,
+                usdt_by_base[base],
+                usdc_by_base[base],
+                conversion_symbol,
+                inverted,
+            )
+            for base in usdt_by_base.keys() & usdc_by_base.keys()
+        }
+
     def common_symbols(self, filters: FilterConfig | None = None) -> set[str]:
         filters = filters or FilterConfig(
             quote_assets=tuple(sorted(self.quote_assets)),
@@ -406,15 +454,34 @@ class MarketState:
     def liquid_symbols(self, filters: FilterConfig) -> set[str]:
         return set(self.liquid_routes(filters))
 
+    def liquid_futures_futures_routes(
+        self, filters: FilterConfig
+    ) -> dict[str, FuturesFuturesRoute]:
+        return {
+            key: route
+            for key, route in self.futures_futures_routes(filters).items()
+            if self.futures_volumes[route.usdt_symbol].quote_volume
+            >= filters.min_futures_volume
+            and self.futures_volumes[route.usdc_symbol].quote_volume
+            >= filters.min_futures_volume
+        }
+
     def book_symbols(self, market: str, filters: FilterConfig) -> set[str]:
         routes = self.liquid_routes(filters)
+        futures_futures = self.liquid_futures_futures_routes(filters)
         self.active_routes = routes
         if market == "futures":
-            return {route.futures_symbol for route in routes.values()}
+            symbols = {route.futures_symbol for route in routes.values()}
+            symbols.update(route.usdt_symbol for route in futures_futures.values())
+            symbols.update(route.usdc_symbol for route in futures_futures.values())
+            return symbols
         symbols = {route.spot_symbol for route in routes.values()}
         symbols.update(
             route.conversion_symbol for route in routes.values()
             if route.conversion_symbol
+        )
+        symbols.update(
+            route.conversion_symbol for route in futures_futures.values()
         )
         return symbols
 
@@ -483,6 +550,75 @@ class MarketState:
             ))
         return result
 
+    def futures_futures_snapshots(
+        self, filters: FilterConfig, stale_seconds: float
+    ) -> list[PairSnapshot]:
+        if not self.streams_healthy(stale_seconds):
+            return []
+        now = time.monotonic()
+        result: list[PairSnapshot] = []
+        for route in self.liquid_futures_futures_routes(filters).values():
+            usdt = self.futures_books.get(route.usdt_symbol)
+            usdc = self.futures_books.get(route.usdc_symbol)
+            conversion_book = self.spot_books.get(route.conversion_symbol)
+            if not usdt or not usdc or not conversion_book or conversion_book.mid <= 0:
+                continue
+            conversion_rate = (
+                1 / conversion_book.mid
+                if route.conversion_inverted else conversion_book.mid
+            )
+            if max(
+                now - usdt.received_at,
+                now - usdc.received_at,
+                now - conversion_book.received_at,
+            ) > stale_seconds:
+                continue
+            normalized_usdc_mid = usdc.mid * conversion_rate
+            result.append(PairSnapshot(
+                route.key,
+                usdt.mid,
+                normalized_usdc_mid,
+                (normalized_usdc_mid / usdt.mid - 1) * 10_000,
+                route.usdt_symbol,
+                route.usdc_symbol,
+                conversion_rate,
+                "futures_futures",
+            ))
+        return result
+
+    def futures_futures_quote_age(
+        self, symbol: str, filters: FilterConfig
+    ) -> float | None:
+        route = self.liquid_futures_futures_routes(filters).get(symbol)
+        if route is None:
+            return None
+        usdt = self.futures_books.get(route.usdt_symbol)
+        usdc = self.futures_books.get(route.usdc_symbol)
+        conversion = self.spot_books.get(route.conversion_symbol)
+        if not usdt or not usdc or not conversion:
+            return None
+        now = time.monotonic()
+        return max(
+            now - usdt.received_at,
+            now - usdc.received_at,
+            now - conversion.received_at,
+        )
+
+    def futures_futures_label(self, symbol: str, filters: FilterConfig) -> str:
+        route = self.futures_futures_routes(filters).get(symbol)
+        return route.label if route else symbol
+
+    def futures_futures_volumes(
+        self, symbol: str, filters: FilterConfig
+    ) -> tuple[float, float]:
+        route = self.futures_futures_routes(filters).get(symbol)
+        if route is None:
+            return 0.0, 0.0
+        return (
+            self.futures_volumes[route.usdt_symbol].quote_volume,
+            self.futures_volumes[route.usdc_symbol].quote_volume,
+        )
+
     def quote_age(self, symbol: str, filters: FilterConfig | None = None) -> float | None:
         filters = filters or FilterConfig(
             quote_assets=tuple(sorted(self.quote_assets)),
@@ -529,6 +665,7 @@ class PairStatistics:
     rolling_sum: float = 0.0
     rolling_sum_squares: float = 0.0
     current_spot_mid: float = 0.0
+    current_futures_mid: float = 0.0
     current_basis_bps: float = 0.0
     current_deviation_bps: float = 0.0
     open_count: int = 0
@@ -611,6 +748,7 @@ class PairStatistics:
         previous_mean = self.mean_basis_bps
         previous_sigma = self.standard_deviation_bps
         self.current_spot_mid = snapshot.spot_mid
+        self.current_futures_mid = snapshot.futures_mid
         self.current_basis_bps = current_basis_bps
         self.current_deviation_bps = (
             current_basis_bps - previous_mean if self.sample_count else 0.0
@@ -624,7 +762,10 @@ class PairStatistics:
                 self.upper_excursion_active = False
                 events.append({
                     "event": "open_opportunity",
+                    "market_type": snapshot.market_type,
                     "time": datetime.fromtimestamp(now_wall, timezone.utc).isoformat(),
+                    "leg1_symbol": snapshot.spot_symbol or snapshot.symbol,
+                    "leg2_symbol": snapshot.futures_symbol or snapshot.symbol,
                     "spot_symbol": snapshot.spot_symbol or snapshot.symbol,
                     "futures_symbol": snapshot.futures_symbol or snapshot.symbol,
                     "spot_mid": snapshot.spot_mid,
@@ -645,7 +786,10 @@ class PairStatistics:
                 self.lower_excursion_active = False
                 events.append({
                     "event": "close_opportunity",
+                    "market_type": snapshot.market_type,
                     "time": datetime.fromtimestamp(now_wall, timezone.utc).isoformat(),
+                    "leg1_symbol": snapshot.spot_symbol or snapshot.symbol,
+                    "leg2_symbol": snapshot.futures_symbol or snapshot.symbol,
                     "spot_symbol": snapshot.spot_symbol or snapshot.symbol,
                     "futures_symbol": snapshot.futures_symbol or snapshot.symbol,
                     "spot_mid": snapshot.spot_mid,
@@ -686,6 +830,7 @@ class PairDirectoryStore:
                     "mean_basis_bps": stats.mean_basis_bps,
                     "standard_deviation_bps": stats.standard_deviation_bps,
                     "current_spot_mid": stats.current_spot_mid,
+                    "current_futures_mid": stats.current_futures_mid,
                     "current_basis_bps": stats.current_basis_bps,
                     "current_deviation_bps": stats.current_deviation_bps,
                     "open_count": stats.open_count,
@@ -991,7 +1136,7 @@ def render(
         and age <= runtime.stale_seconds
     ]
     lines = [
-        "Binance 现货－USDT/USDC-M 永续基差波动筛选",
+        "Binance 现货－USDT/USDC-M 永续基差波动筛选  [按 K 切换到永续－永续]",
         f"成交额流: 现货 {'在线' if state.ticker_connected['spot'] else '重连中'} / "
         f"永续 {'在线' if state.ticker_connected['futures'] else '重连中'} | "
         f"盘口流: 现货 {'在线' if state.book_connected['spot'] else '重连中'} / "
@@ -1018,7 +1163,7 @@ def render(
     quantile_name = (
         f"P{stats_config.quantile_low * 100:g}～P{stats_config.quantile_high * 100:g}"
     )
-    widths = [3, 21, 13, 13, 16, 10, 12, 21, 21, 21, 11, 10, 10, 10, 10]
+    widths = [3, 28, 13, 13, 16, 10, 21, 21, 21, 21, 11, 10, 10, 10, 10]
     aligns = [
         "right", "left", "right", "right", "right", "right",
         "right", "right", "right", "right", "right", "right",
@@ -1030,7 +1175,7 @@ def render(
         "【基差机会统计】",
         separator,
         table_row(
-            ["#", "现货/永续", "现货成交额", "永续成交额", "现货价格", "μ", "μ+kσ", f"{quantile_name}短窗", f"{quantile_name}长窗", "运行范围", "当前价差", "当前位置", "行情年龄", "开仓机会", "平仓机会"],
+            ["#", "现货/永续", "现货成交额", "永续成交额", "现货价格", "μ", f"μ±{stats_config.sigma_multiplier:.0f}σ", f"{quantile_name}短窗", f"{quantile_name}长窗", "运行范围", "当前价差", "当前位置", "行情年龄", "开仓机会", "平仓机会"],
             widths, aligns,
         ),
         separator,
@@ -1039,6 +1184,7 @@ def render(
         for index, stats in enumerate(rows[: filters.top], 1):
             sigma = stats.standard_deviation_bps
             upper_sigma = stats.mean_basis_bps + stats_config.sigma_multiplier * sigma
+            lower_sigma = stats.mean_basis_bps - stats_config.sigma_multiplier * sigma
             short_quantiles = stats.quantile_range(
                 stats_config.short_window_samples,
                 stats_config.quantile_low,
@@ -1069,7 +1215,7 @@ def render(
                 format_quote_volume(futures_volume),
                 f"{stats.current_spot_mid:.8g}",
                 f"{stats.mean_basis_bps:+.2f}bp",
-                f"{upper_sigma:+.2f}bp", short_text, long_text, runtime_text,
+                f"{lower_sigma:+.2f}～{upper_sigma:+.2f}bp", short_text, long_text, runtime_text,
                 f"{stats.current_basis_bps:+.2f}bp",
                 f"{stats.sigma_position:+.2f}σ", f"{quote_age:.1f}秒",
                 f"{stats.open_count}次", f"{stats.close_count}次",
@@ -1086,6 +1232,127 @@ def render(
     return "\n".join(lines)
 
 
+def render_futures_futures(
+    state: MarketState,
+    engine: StatisticsEngine,
+    filters: FilterConfig,
+    stats_config: StatisticsConfig,
+    runtime: RuntimeConfig,
+    started_mono: float,
+    config_errors: list[str],
+) -> str:
+    routes = state.liquid_futures_futures_routes(filters)
+    rows = engine.selected_rows(False, stats_config)
+    rows = [
+        stats for stats in rows
+        if stats.symbol in routes
+        and (age := state.futures_futures_quote_age(stats.symbol, filters)) is not None
+        and age <= runtime.stale_seconds
+    ]
+    lines = [
+        "Binance USDT永续－USDC永续价差波动筛选  [按 K 切换到现货－永续]",
+        f"成交额流: 永续 {'在线' if state.ticker_connected['futures'] else '重连中'} | "
+        f"盘口流: 永续 {'在线' if state.book_connected['futures'] else '重连中'} / "
+        f"USDCUSDT现货 {'在线' if state.book_connected['spot'] else '重连中'}",
+        f"共同永续路线: {len(state.futures_futures_routes(filters))} | "
+        f"成交额达标: {len(routes)} | 入选统计: {len(rows)} | "
+        f"采样周期: {runtime.sample_interval_ms}ms | "
+        f"本次运行: {format_duration(time.monotonic() - started_mono)}",
+        f"样本窗口: 总{stats_config.total_window_samples} / 长{stats_config.long_window_samples} / "
+        f"短{stats_config.short_window_samples} | "
+        f"初筛: {stats_config.sigma_multiplier:g}σ > {stats_config.min_k_sigma_bps:g}bp",
+        f"开仓机会: 上穿 μ+{stats_config.open_threshold_bps:g}bp 后回落至 μ | "
+        f"平仓机会: 下穿 μ{stats_config.close_threshold_bps:+g}bp 后回升至 μ",
+    ]
+    for message in config_errors:
+        lines.append(f"配置错误: {message}")
+    for key, message in state.errors.items():
+        if message:
+            lines.append(f"{key} 错误: {message}")
+    quantile_name = (
+        f"P{stats_config.quantile_low * 100:g}～P{stats_config.quantile_high * 100:g}"
+    )
+    widths = [3, 28, 13, 13, 16, 16, 10, 21, 21, 21, 21, 11, 10, 10, 10, 10]
+    aligns = ["right", "left"] + ["right"] * 14
+    separator = "-" * (sum(widths) + 2 * (len(widths) - 1))
+    lines += [
+        "",
+        "【USDT永续－USDC永续价差统计】",
+        separator,
+        table_row(
+            ["#", "USDT永续/USDC永续", "USDT成交额", "USDC成交额", "USDT永续价",
+             "USDC折算价", "μ", f"μ±{stats_config.sigma_multiplier:.0f}σ", f"{quantile_name}短窗", f"{quantile_name}长窗",
+             "运行范围", "当前价差", "当前位置", "行情年龄", "开仓机会", "平仓机会"],
+            widths, aligns,
+        ),
+        separator,
+    ]
+    if rows:
+        for index, stats in enumerate(rows[: filters.top], 1):
+            sigma = stats.standard_deviation_bps
+            short_quantiles = stats.quantile_range(
+                stats_config.short_window_samples,
+                stats_config.quantile_low,
+                stats_config.quantile_high,
+            )
+            long_quantiles = stats.quantile_range(
+                stats_config.long_window_samples,
+                stats_config.quantile_low,
+                stats_config.quantile_high,
+            )
+            runtime_range = stats.runtime_range
+            short_text = (
+                f"{short_quantiles[0]:+.2f}～{short_quantiles[1]:+.2f}bp"
+                if short_quantiles else "--"
+            )
+            long_text = (
+                f"{long_quantiles[0]:+.2f}～{long_quantiles[1]:+.2f}bp"
+                if long_quantiles else "--"
+            )
+            runtime_text = (
+                f"{runtime_range[0]:+.2f}～{runtime_range[1]:+.2f}bp"
+                if runtime_range else "--"
+            )
+            usdt_volume, usdc_volume = state.futures_futures_volumes(
+                stats.symbol, filters
+            )
+            quote_age = state.futures_futures_quote_age(stats.symbol, filters)
+            lines.append(table_row([
+                str(index), state.futures_futures_label(stats.symbol, filters),
+                format_quote_volume(usdt_volume), format_quote_volume(usdc_volume),
+                f"{stats.current_spot_mid:.8g}", f"{stats.current_futures_mid:.8g}",
+                f"{stats.mean_basis_bps:+.2f}bp",
+                f"{stats.mean_basis_bps - stats_config.sigma_multiplier * sigma:+.2f}～{stats.mean_basis_bps + stats_config.sigma_multiplier * sigma:+.2f}bp",
+                short_text, long_text, runtime_text,
+                f"{stats.current_basis_bps:+.2f}bp", f"{stats.sigma_position:+.2f}σ",
+                f"{quote_age:.1f}秒", f"{stats.open_count}次", f"{stats.close_count}次",
+            ], widths, aligns))
+    else:
+        lines.append(
+            f"暂无永续路线满足初筛：{stats_config.sigma_multiplier:g}σ > "
+            f"{stats_config.min_k_sigma_bps:g}bp。"
+        )
+    lines += [
+        separator,
+        "价差 = (USDC永续折算中间价 / USDT永续中间价 - 1) × 10000；折算使用USDCUSDT现货中间价。",
+    ]
+    return "\n".join(lines)
+
+
+def poll_page_toggle(current_page: str) -> str:
+    if os.name != "nt":
+        return current_page
+    import msvcrt
+
+    while msvcrt.kbhit():
+        if msvcrt.getwch().lower() == "k":
+            current_page = (
+                "futures_futures"
+                if current_page == "spot_futures" else "spot_futures"
+            )
+    return current_page
+
+
 def resolve_path(path_text: str) -> Path:
     path = Path(path_text)
     return path if path.is_absolute() else BASE_DIR / path
@@ -1094,9 +1361,15 @@ def resolve_path(path_text: str) -> Path:
 async def run() -> None:
     filter_manager = ConfigManager(FILTER_CONFIG_PATH, FilterConfig)
     statistics_manager = ConfigManager(STATISTICS_CONFIG_PATH, StatisticsConfig)
+    futures_futures_statistics_manager = ConfigManager(
+        FUTURES_FUTURES_STATISTICS_CONFIG_PATH, StatisticsConfig
+    )
     runtime_manager = ConfigManager(RUNTIME_CONFIG_PATH, RuntimeConfig)
-    store = PairDirectoryStore(resolve_path(runtime_manager.current.data_directory))
+    data_root = resolve_path(runtime_manager.current.data_directory)
+    store = PairDirectoryStore(data_root / "spot_futures")
+    futures_futures_store = PairDirectoryStore(data_root / "futures_futures")
     engine = StatisticsEngine(store.load())
+    futures_futures_engine = StatisticsEngine(futures_futures_store.load())
     state = MarketState(runtime_manager.current.bbo_queue_maxsize)
     stop = asyncio.Event()
     state.set_pairing_config(filter_manager.current)
@@ -1119,6 +1392,7 @@ async def run() -> None:
     ]
     last_display = last_persist = 0.0
     next_sample = time.monotonic()
+    current_page = "spot_futures"
     try:
         while not stop.is_set():
             for task in tasks:
@@ -1129,11 +1403,16 @@ async def run() -> None:
                     raise RuntimeError("后台任务意外停止")
             filter_manager.reload()
             statistics_manager.reload()
+            futures_futures_statistics_manager.reload()
             runtime_manager.reload()
             filters = filter_manager.current
             state.set_pairing_config(filters)
             stats_config = statistics_manager.current
+            futures_futures_stats_config = futures_futures_statistics_manager.current
             engine.resize_windows(stats_config.total_window_samples)
+            futures_futures_engine.resize_windows(
+                futures_futures_stats_config.total_window_samples
+            )
             runtime = runtime_manager.current
             sample_interval = runtime.sample_interval_ms / 1000
             now_mono = time.monotonic()
@@ -1144,18 +1423,49 @@ async def run() -> None:
                 if not filters.positive_basis_only or stats.mean_basis_bps > 0:
                     store.append_opportunity(symbol, opportunity)
 
+            futures_futures_snapshots = state.futures_futures_snapshots(
+                filters, runtime.stale_seconds
+            )
+            futures_futures_opportunities = futures_futures_engine.update(
+                futures_futures_snapshots,
+                sample_interval,
+                futures_futures_stats_config,
+            )
+            for symbol, opportunity in futures_futures_opportunities:
+                futures_futures_store.append_opportunity(symbol, opportunity)
+
             if now_mono - last_persist >= runtime.persist_interval_seconds:
                 store.save_states(engine.eligible_rows(filters.positive_basis_only))
+                futures_futures_store.save_states(
+                    futures_futures_engine.eligible_rows(False)
+                )
                 last_persist = now_mono
+            current_page = poll_page_toggle(current_page)
             if now_mono - last_display >= runtime.display_refresh_seconds:
                 errors = [
                     manager.error
-                    for manager in (filter_manager, statistics_manager, runtime_manager)
+                    for manager in (
+                        filter_manager,
+                        statistics_manager,
+                        futures_futures_statistics_manager,
+                        runtime_manager,
+                    )
                     if manager.error
                 ]
+                screen = (
+                    render(
+                        state, engine, filters, stats_config,
+                        runtime, started_mono, errors,
+                    )
+                    if current_page == "spot_futures"
+                    else render_futures_futures(
+                        state, futures_futures_engine, filters,
+                        futures_futures_stats_config, runtime,
+                        started_mono, errors,
+                    )
+                )
                 print(
-                    "\x1b[2J\x1b[H"
-                    + render(state, engine, filters, stats_config, runtime, started_mono, errors),
+                    "\x1b[2J\x1b[H" + screen,
                     end="",
                     flush=True,
                 )
@@ -1172,6 +1482,9 @@ async def run() -> None:
     finally:
         stop.set()
         store.save_states(engine.eligible_rows(filter_manager.current.positive_basis_only))
+        futures_futures_store.save_states(
+            futures_futures_engine.eligible_rows(False)
+        )
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
