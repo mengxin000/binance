@@ -21,6 +21,16 @@ FUTURES_TICKER_STREAM = "wss://fstream.binance.com/market/ws/!ticker@arr"
 # 流
 SPOT_BOOK_BASE = "wss://data-stream.binance.vision/stream?streams="
 FUTURES_BOOK_BASE = "wss://fstream.binance.com/public/stream?streams="
+# Binance 每20秒主动发送 Ping；websockets 会自动回传同载荷 Pong。
+# 禁用客户端额外 Ping，避免本地 ping_timeout 以 1011 主动断开连接。
+BINANCE_WEBSOCKET_OPTIONS = {
+    "proxy": None,
+    "open_timeout": 20,
+    "ping_interval": None,
+    "ping_timeout": None,
+    "close_timeout": 5,
+    "max_size": 8_000_000,
+}
 FILTER_CONFIG_PATH = BASE_DIR / "filter_config.json"
 STATISTICS_CONFIG_PATH = BASE_DIR / "statistics_config.json"
 FUTURES_FUTURES_STATISTICS_CONFIG_PATH = BASE_DIR / "futures_futures_statistics_config.json"
@@ -930,8 +940,7 @@ async def consume_tickers(url: str, market: str, state: MarketState, stop: async
     while not stop.is_set():
         try:
             async with websockets.connect(
-                url, proxy=None, open_timeout=20, ping_interval=20, ping_timeout=20,
-                close_timeout=5, max_size=8_000_000,
+                url, **BINANCE_WEBSOCKET_OPTIONS,
             ) as websocket:
                 state.ticker_connected[market] = True
                 state.errors[error_key] = ""
@@ -973,8 +982,7 @@ async def consume_books(
         streams = "/".join(f"{symbol.lower()}@bookTicker" for symbol in sorted(symbols))
         try:
             async with websockets.connect(
-                base_url + streams, proxy=None, open_timeout=20, ping_interval=20,
-                ping_timeout=20, close_timeout=5, max_size=8_000_000,
+                base_url + streams, **BINANCE_WEBSOCKET_OPTIONS,
             ) as websocket:
                 state.book_connected[market] = True
                 state.errors[error_key] = ""

@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from main import (
+    BINANCE_WEBSOCKET_OPTIONS,
     ConfigManager,
     FilterConfig,
     PairDirectoryStore,
@@ -246,6 +247,10 @@ class MarketStateTests(unittest.TestCase):
 
 
 class ConfigManagerTests(unittest.TestCase):
+    def test_binance_uses_server_heartbeat_without_client_ping_timeout(self):
+        self.assertIsNone(BINANCE_WEBSOCKET_OPTIONS["ping_interval"])
+        self.assertIsNone(BINANCE_WEBSOCKET_OPTIONS["ping_timeout"])
+
     def test_invalid_hot_reload_keeps_last_valid_config(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "filter.json"
