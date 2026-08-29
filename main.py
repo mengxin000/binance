@@ -276,10 +276,8 @@ class MarketState:
         self.spot_books: dict[str, BookQuote] = {}
         self.futures_books: dict[str, BookQuote] = {}
         self.active_routes: dict[str, PairRoute] = {}
-        self.bbo_updates: asyncio.Queue[BboSnapshot] = asyncio.Queue(
-            maxsize=bbo_queue_maxsize
-        )
-        self.bbo_dropped = 0
+        # 移除 BBO 队列，改为在主循环定时采样时统一处理
+        self.routes_version: int = 0
         self.ticker_connected = {"spot": False, "futures": False}
         self.book_connected = {"spot": False, "futures": False}
         self.ticker_last_update = {"spot": 0.0, "futures": 0.0}
@@ -312,34 +310,14 @@ class MarketState:
             return
         now = time.monotonic()
         destination = self.spot_books if market == "spot" else self.futures_books
+        # 价格连续性检查：单次跳变超过 10% 视为脏数据，拒绝更新
+        old_quote = destination.get(symbol)
+        if old_quote is not None and old_quote.mid > 0:
+            new_mid = (bid + ask) / 2
+            if abs(new_mid / old_quote.mid - 1) > 0.10:
+                return
         destination[symbol] = BookQuote(bid, ask, now)
         self.book_last_update[market] = now
-        routes = list(self.active_routes.values())
-        if not routes:
-            # 保留同名配对的直接用法，正式运行时订阅前会建立 active_routes。
-            spot = self.spot_books.get(symbol)
-            futures = self.futures_books.get(symbol)
-            if spot and futures:
-                routes = [PairRoute(symbol, symbol, symbol, symbol, "", "")]
-        for route in routes:
-            relevant = (
-                (market == "spot" and symbol in {route.spot_symbol, route.conversion_symbol})
-                or (market == "futures" and symbol == route.futures_symbol)
-            )
-            if not relevant:
-                continue
-            snapshot = self._bbo_snapshot(route, market)
-            if snapshot is not None:
-                self._enqueue_bbo(snapshot)
-
-    def _enqueue_bbo(self, snapshot: BboSnapshot) -> None:
-        if self.bbo_updates.full():
-            try:
-                self.bbo_updates.get_nowait()
-                self.bbo_dropped += 1
-            except asyncio.QueueEmpty:
-                pass
-        self.bbo_updates.put_nowait(snapshot)
 
     def _split_symbol(self, symbol: str) -> tuple[str, str] | None:
         for quote in sorted(self.quote_assets, key=len, reverse=True):
@@ -363,11 +341,12 @@ class MarketState:
     def pair_routes(self, filters: FilterConfig) -> dict[str, PairRoute]:
         spot_by_asset: dict[tuple[str, str], str] = {}
         futures_by_asset: dict[tuple[str, str], str] = {}
-        for symbol in self.spot_volumes:
+        # 使用 list() 避免遍历期间 dict 被并发修改导致 RuntimeError
+        for symbol in list(self.spot_volumes):
             parsed = self._split_symbol(symbol)
             if parsed:
                 spot_by_asset[parsed] = symbol
-        for symbol in self.futures_volumes:
+        for symbol in list(self.futures_volumes):
             parsed = self._split_symbol(symbol)
             if parsed:
                 futures_by_asset[parsed] = symbol
@@ -410,7 +389,7 @@ class MarketState:
         conversion_symbol, inverted = conversion
         usdt_by_base: dict[str, str] = {}
         usdc_by_base: dict[str, str] = {}
-        for symbol in self.futures_volumes:
+        for symbol in list(self.futures_volumes):
             parsed = self._split_symbol(symbol)
             if not parsed:
                 continue
@@ -445,10 +424,12 @@ class MarketState:
             assets.update((spot_quote, futures_quote))
         self.quote_assets = frozenset(assets)
         self.cross_quote_pairings = cross
+        self.routes_version += 1
 
     def set_quote_assets(self, quote_assets: tuple[str, ...] | list[str]) -> None:
         self.quote_assets = frozenset(quote_assets)
         self.cross_quote_pairings = ()
+        self.routes_version += 1
 
     def is_allowed_symbol(self, symbol: str) -> bool:
         return any(symbol.endswith(asset) for asset in self.quote_assets)
@@ -518,6 +499,31 @@ class MarketState:
             rate, route.conversion_symbol, conversion_received_at,
         )
 
+    def get_bbo_snapshot(self, route: PairRoute, stale_seconds: float) -> BboSnapshot | None:
+        """在主循环统一采样点生成对齐的 BBO 快照，替代在 websocket 回调中分散生成。"""
+        spot = self.spot_books.get(route.spot_symbol)
+        futures = self.futures_books.get(route.futures_symbol)
+        conversion = self._conversion_rate(route)
+        if spot is None or futures is None or conversion is None:
+            return None
+        rate, conversion_received_at = conversion
+        now = time.monotonic()
+        ages = [now - spot.received_at, now - futures.received_at]
+        if route.conversion_symbol:
+            ages.append(now - conversion_received_at)
+        if max(ages) > stale_seconds:
+            return None
+        # 三腿时间对齐检查：各 leg 接收时间差超过 500ms 视为未对齐，拒绝采样
+        if len(ages) >= 2 and max(ages) - min(ages) > 0.5:
+            return None
+        return BboSnapshot(
+            route.key, route.spot_symbol, route.futures_symbol,
+            "unified", time.time(),
+            spot.bid, spot.ask, futures.bid, futures.ask,
+            spot.received_at, futures.received_at,
+            rate, route.conversion_symbol, conversion_received_at,
+        )
+
     def eligible_symbols(self, filters: FilterConfig) -> set[str]:
         return {
             key for key, route in self.liquid_routes(filters).items()
@@ -552,6 +558,9 @@ class MarketState:
                 ages.append(now - conversion_received_at)
             if max(ages) > stale_seconds:
                 continue
+            # 三腿时间对齐检查
+            if len(ages) >= 2 and max(ages) - min(ages) > 0.5:
+                continue
             spot_mid, futures_mid = spot.mid, futures.mid * rate
             result.append(PairSnapshot(
                 key, spot_mid, futures_mid,
@@ -577,11 +586,15 @@ class MarketState:
                 1 / conversion_book.mid
                 if route.conversion_inverted else conversion_book.mid
             )
-            if max(
+            ages = [
                 now - usdt.received_at,
                 now - usdc.received_at,
                 now - conversion_book.received_at,
-            ) > stale_seconds:
+            ]
+            if max(ages) > stale_seconds:
+                continue
+            # 三腿时间对齐检查
+            if max(ages) - min(ages) > 0.5:
                 continue
             normalized_usdc_mid = usdc.mid * conversion_rate
             result.append(PairSnapshot(
@@ -672,8 +685,10 @@ class PairStatistics:
     sample_count: int = 0
     observed_seconds: float = 0.0
     mean_basis_bps: float = 0.0
-    rolling_sum: float = 0.0
-    rolling_sum_squares: float = 0.0
+    # Welford 在线算法状态（替代 rolling_sum / rolling_sum_squares，避免浮点精度灾难）
+    _welford_mean: float = 0.0
+    _welford_m2: float = 0.0
+    _last_basis_bps: float | None = None
     current_spot_mid: float = 0.0
     current_futures_mid: float = 0.0
     current_basis_bps: float = 0.0
@@ -690,7 +705,8 @@ class PairStatistics:
     def standard_deviation_bps(self) -> float:
         if self.sample_count < 2:
             return 0.0
-        variance = self.rolling_sum_squares / self.sample_count - self.mean_basis_bps ** 2
+        # 样本标准差（无偏估计）
+        variance = self._welford_m2 / (self.sample_count - 1)
         return max(0.0, variance) ** 0.5
 
     @property
@@ -731,20 +747,36 @@ class PairStatistics:
             return None
         return min(self.basis_samples), max(self.basis_samples)
 
+    def _recompute_welford(self) -> None:
+        """从当前 basis_samples 重新计算 Welford 状态（用于 resize_window 后）。"""
+        self._welford_mean = 0.0
+        self._welford_m2 = 0.0
+        n = len(self.basis_samples)
+        self.sample_count = n
+        if n == 0:
+            self.mean_basis_bps = 0.0
+            return
+        for i, x in enumerate(self.basis_samples):
+            delta = x - self._welford_mean
+            self._welford_mean += delta / (i + 1)
+            delta2 = x - self._welford_mean
+            self._welford_m2 += delta * delta2
+        self.mean_basis_bps = self._welford_mean
+
     def resize_window(self, total_window_samples: int) -> None:
         while len(self.basis_samples) > total_window_samples:
-            removed = self.basis_samples.popleft()
-            self.rolling_sum -= removed
-            self.rolling_sum_squares -= removed * removed
-        self.sample_count = len(self.basis_samples)
-        self.mean_basis_bps = (
-            self.rolling_sum / self.sample_count if self.sample_count else 0.0
-        )
+            self.basis_samples.popleft()
+        self._recompute_welford()
 
     def _append_sample(self, basis_bps: float, total_window_samples: int) -> None:
         self.basis_samples.append(basis_bps)
-        self.rolling_sum += basis_bps
-        self.rolling_sum_squares += basis_bps * basis_bps
+        # Welford 增量更新
+        self.sample_count += 1
+        delta = basis_bps - self._welford_mean
+        self._welford_mean += delta / self.sample_count
+        delta2 = basis_bps - self._welford_mean
+        self._welford_m2 += delta * delta2
+        self.mean_basis_bps = self._welford_mean
         self.resize_window(total_window_samples)
 
     def update(
@@ -757,13 +789,50 @@ class PairStatistics:
         current_basis_bps = snapshot.basis_bps
         previous_mean = self.mean_basis_bps
         previous_sigma = self.standard_deviation_bps
+
+        # ── 异常值过滤层 ──
+        events: list[dict[str, Any]] = []
+        if self.sample_count >= 10:
+            # 1. Z-Score 过滤：与历史均值偏差超过 5σ 视为异常
+            if previous_sigma > 0:
+                z_score = abs(current_basis_bps - previous_mean) / previous_sigma
+                if z_score > 5.0:
+                    events.append({
+                        "event": "anomaly_rejected",
+                        "market_type": snapshot.market_type,
+                        "time": datetime.fromtimestamp(now_wall, timezone.utc).isoformat(),
+                        "symbol": self.symbol,
+                        "basis_bps": current_basis_bps,
+                        "mean_basis_bps": previous_mean,
+                        "standard_deviation_bps": previous_sigma,
+                        "z_score": round(z_score, 2),
+                        "reason": "z_score_exceeds_5",
+                    })
+                    return events
+            # 2. 连续性过滤：相邻样本 basis 跳变超过 500bps（5%）视为异常
+            if self._last_basis_bps is not None:
+                jump = abs(current_basis_bps - self._last_basis_bps)
+                if jump > 500.0:
+                    events.append({
+                        "event": "anomaly_rejected",
+                        "market_type": snapshot.market_type,
+                        "time": datetime.fromtimestamp(now_wall, timezone.utc).isoformat(),
+                        "symbol": self.symbol,
+                        "basis_bps": current_basis_bps,
+                        "last_basis_bps": self._last_basis_bps,
+                        "jump_bps": round(jump, 2),
+                        "reason": "basis_jump_exceeds_500bps",
+                    })
+                    return events
+
         self.current_spot_mid = snapshot.spot_mid
         self.current_futures_mid = snapshot.futures_mid
         self.current_basis_bps = current_basis_bps
         self.current_deviation_bps = (
             current_basis_bps - previous_mean if self.sample_count else 0.0
         )
-        events: list[dict[str, Any]] = []
+        self._last_basis_bps = current_basis_bps
+
         if self.sample_count:
             if not self.upper_excursion_active and self.current_deviation_bps >= config.open_threshold_bps:
                 self.upper_excursion_active = True
@@ -813,8 +882,15 @@ class PairStatistics:
                     "opportunity_number": self.close_count,
                 })
 
+        # ── observed_seconds 修复：使用实际 wall time 差值，而非固定间隔 ──
+        if self.last_sample_at is not None:
+            actual_interval = now_wall - self.last_sample_at
+            # 上限保护：防止时钟跳变或长时间阻塞导致极端值
+            self.observed_seconds += min(actual_interval, sample_interval_seconds * 3)
+        else:
+            self.observed_seconds += sample_interval_seconds
+
         self._append_sample(current_basis_bps, config.total_window_samples)
-        self.observed_seconds += sample_interval_seconds
         self.last_sample_at = now_wall
         return events
 
@@ -971,6 +1047,7 @@ async def consume_books(
     base_url = SPOT_BOOK_BASE if market == "spot" else FUTURES_BOOK_BASE
     error_key = f"{market}_book"
     delay = 1.0
+    last_routes_version = -1
     while not stop.is_set():
         symbols = state.book_symbols(market, filter_manager.current)
         if not symbols:
@@ -979,6 +1056,7 @@ async def consume_books(
             except asyncio.TimeoutError:
                 pass
             continue
+        last_routes_version = state.routes_version
         streams = "/".join(f"{symbol.lower()}@bookTicker" for symbol in sorted(symbols))
         try:
             async with websockets.connect(
@@ -994,7 +1072,11 @@ async def consume_books(
                     if isinstance(row, dict):
                         state.update_book(market, row)
                     if time.monotonic() - last_check >= 10:
-                        if state.book_symbols(market, filter_manager.current) != symbols:
+                        # 检查 symbol 列表变化或 routes 版本变化（配置热加载）
+                        if (
+                            state.book_symbols(market, filter_manager.current) != symbols
+                            or state.routes_version != last_routes_version
+                        ):
                             break
                         last_check = time.monotonic()
         except asyncio.CancelledError:
@@ -1008,78 +1090,6 @@ async def consume_books(
             delay = min(delay * 2, 30)
         finally:
             state.book_connected[market] = False
-
-
-async def process_bbo_updates(
-    state: MarketState,
-    engine: StatisticsEngine,
-    store: PairDirectoryStore,
-    filter_manager: ConfigManager[FilterConfig],
-    statistics_manager: ConfigManager[StatisticsConfig],
-    runtime_manager: ConfigManager[RuntimeConfig],
-    stop: asyncio.Event,
-) -> None:
-    while not stop.is_set():
-        try:
-            first = await asyncio.wait_for(state.bbo_updates.get(), timeout=1)
-        except asyncio.TimeoutError:
-            continue
-        batch = [first]
-        while len(batch) < 5000:
-            try:
-                batch.append(state.bbo_updates.get_nowait())
-            except asyncio.QueueEmpty:
-                break
-
-        filters = filter_manager.current
-        config = statistics_manager.current
-        stale_seconds = runtime_manager.current.stale_seconds
-        eligible = state.eligible_symbols(filters)
-        now_mono = time.monotonic()
-        records: list[tuple[str, dict[str, Any]]] = []
-        for bbo in batch:
-            if bbo.symbol not in eligible:
-                continue
-            if now_mono - bbo.spot_received_at > stale_seconds or now_mono - bbo.futures_received_at > stale_seconds:
-                continue
-            if (
-                bbo.conversion_symbol
-                and now_mono - bbo.conversion_received_at > stale_seconds
-            ):
-                continue
-            stats = engine.pairs.setdefault(bbo.symbol, PairStatistics(bbo.symbol))
-            basis_bps = bbo.basis_bps
-            if stats.sample_count < 1:
-                continue
-            trigger_basis_bps = stats.mean_basis_bps + config.open_threshold_bps
-            if basis_bps <= trigger_basis_bps:
-                continue
-            if not stats.allow_bbo_record(
-                bbo.timestamp, config.bbo_record_interval_ms / 1000
-            ):
-                continue
-            records.append((bbo.symbol, {
-                "time": datetime.fromtimestamp(bbo.timestamp, timezone.utc).isoformat(),
-                "source_market": bbo.source_market,
-                "spot_symbol": bbo.spot_symbol,
-                "futures_symbol": bbo.futures_symbol,
-                "conversion_symbol": bbo.conversion_symbol or None,
-                "conversion_rate": bbo.conversion_rate,
-                "spot_bid": bbo.spot_bid,
-                "spot_ask": bbo.spot_ask,
-                "spot_mid": bbo.spot_mid,
-                "futures_bid": bbo.futures_bid,
-                "futures_ask": bbo.futures_ask,
-                "raw_futures_mid": bbo.raw_futures_mid,
-                "futures_mid": bbo.futures_mid,
-                "mean_basis_bps": stats.mean_basis_bps,
-                "standard_deviation_bps": stats.standard_deviation_bps,
-                "trigger_basis_bps": trigger_basis_bps,
-                "basis_bps": basis_bps,
-                "deviation_bps": basis_bps - stats.mean_basis_bps,
-            }))
-        if records:
-            store.append_bbo_records(records)
 
 
 def format_duration(seconds: float) -> str:
@@ -1159,8 +1169,6 @@ def render(
         f"初筛: {stats_config.sigma_multiplier:g}σ > {stats_config.min_k_sigma_bps:g}bp",
         f"开仓机会: 上穿 μ+{stats_config.open_threshold_bps:g}bp 后回落至 μ | "
         f"平仓机会: 下穿 μ{stats_config.close_threshold_bps:+g}bp 后回升至 μ",
-        f"BBO队列: {state.bbo_updates.qsize()}/{state.bbo_updates.maxsize} | "
-        f"已丢弃旧快照: {state.bbo_dropped}",
         f"市场准入: 现货中间价 > {filters.min_spot_price:g} USDT/USDC",
     ]
     for message in config_errors:
@@ -1389,14 +1397,12 @@ async def run() -> None:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass
+    # 移除 process_bbo_updates 后台任务，改为在主循环统一采样点处理 BBO，消除队列丢弃偏差
     tasks = [
         asyncio.create_task(consume_tickers(SPOT_TICKER_STREAM, "spot", state, stop)),
         asyncio.create_task(consume_tickers(FUTURES_TICKER_STREAM, "futures", state, stop)),
         asyncio.create_task(consume_books("spot", state, filter_manager, stop)),
         asyncio.create_task(consume_books("futures", state, filter_manager, stop)),
-        asyncio.create_task(process_bbo_updates(
-            state, engine, store, filter_manager, statistics_manager, runtime_manager, stop,
-        )),
     ]
     last_display = last_persist = 0.0
     next_sample = time.monotonic()
@@ -1424,13 +1430,59 @@ async def run() -> None:
             runtime = runtime_manager.current
             sample_interval = runtime.sample_interval_ms / 1000
             now_mono = time.monotonic()
+            now_wall = time.time()
+
+            # ── 现货-永续 统一采样 ──
             snapshots = state.snapshots(filters, runtime.stale_seconds)
-            opportunities = engine.update(snapshots, sample_interval, stats_config)
+            opportunities = engine.update(snapshots, sample_interval, stats_config, now_wall)
             for symbol, opportunity in opportunities:
                 stats = engine.pairs[symbol]
                 if not filters.positive_basis_only or stats.mean_basis_bps > 0:
                     store.append_opportunity(symbol, opportunity)
 
+            # ── 现货-永续 BBO 记录（统一采样点生成，避免时间错配和队列丢弃偏差）──
+            eligible = state.eligible_symbols(filters)
+            bbo_records: list[tuple[str, dict[str, Any]]] = []
+            for key, route in state.liquid_routes(filters).items():
+                if key not in eligible:
+                    continue
+                bbo = state.get_bbo_snapshot(route, runtime.stale_seconds)
+                if bbo is None:
+                    continue
+                stats = engine.pairs.get(bbo.symbol)
+                if stats is None or stats.sample_count < 1:
+                    continue
+                trigger_basis_bps = stats.mean_basis_bps + stats_config.open_threshold_bps
+                if bbo.basis_bps <= trigger_basis_bps:
+                    continue
+                if not stats.allow_bbo_record(
+                    bbo.timestamp, stats_config.bbo_record_interval_ms / 1000
+                ):
+                    continue
+                bbo_records.append((bbo.symbol, {
+                    "time": datetime.fromtimestamp(bbo.timestamp, timezone.utc).isoformat(),
+                    "source_market": bbo.source_market,
+                    "spot_symbol": bbo.spot_symbol,
+                    "futures_symbol": bbo.futures_symbol,
+                    "conversion_symbol": bbo.conversion_symbol or None,
+                    "conversion_rate": bbo.conversion_rate,
+                    "spot_bid": bbo.spot_bid,
+                    "spot_ask": bbo.spot_ask,
+                    "spot_mid": bbo.spot_mid,
+                    "futures_bid": bbo.futures_bid,
+                    "futures_ask": bbo.futures_ask,
+                    "raw_futures_mid": bbo.raw_futures_mid,
+                    "futures_mid": bbo.futures_mid,
+                    "mean_basis_bps": stats.mean_basis_bps,
+                    "standard_deviation_bps": stats.standard_deviation_bps,
+                    "trigger_basis_bps": trigger_basis_bps,
+                    "basis_bps": bbo.basis_bps,
+                    "deviation_bps": bbo.basis_bps - stats.mean_basis_bps,
+                }))
+            if bbo_records:
+                store.append_bbo_records(bbo_records)
+
+            # ── 永续-永续 统一采样 ──
             futures_futures_snapshots = state.futures_futures_snapshots(
                 filters, runtime.stale_seconds
             )
@@ -1438,9 +1490,66 @@ async def run() -> None:
                 futures_futures_snapshots,
                 sample_interval,
                 futures_futures_stats_config,
+                now_wall,
             )
             for symbol, opportunity in futures_futures_opportunities:
                 futures_futures_store.append_opportunity(symbol, opportunity)
+
+            # ── 永续-永续 BBO 记录 ──
+            ff_routes = state.liquid_futures_futures_routes(filters)
+            ff_bbo_records: list[tuple[str, dict[str, Any]]] = []
+            for key, route in ff_routes.items():
+                usdt = state.futures_books.get(route.usdt_symbol)
+                usdc = state.futures_books.get(route.usdc_symbol)
+                conversion_book = state.spot_books.get(route.conversion_symbol)
+                if not usdt or not usdc or not conversion_book or conversion_book.mid <= 0:
+                    continue
+                now_mono_chk = time.monotonic()
+                ages = [
+                    now_mono_chk - usdt.received_at,
+                    now_mono_chk - usdc.received_at,
+                    now_mono_chk - conversion_book.received_at,
+                ]
+                if max(ages) > runtime.stale_seconds or max(ages) - min(ages) > 0.5:
+                    continue
+                conversion_rate = (
+                    1 / conversion_book.mid
+                    if route.conversion_inverted else conversion_book.mid
+                )
+                normalized_usdc_mid = usdc.mid * conversion_rate
+                basis_bps = (normalized_usdc_mid / usdt.mid - 1) * 10_000
+                stats = futures_futures_engine.pairs.get(key)
+                if stats is None or stats.sample_count < 1:
+                    continue
+                trigger_basis_bps = stats.mean_basis_bps + futures_futures_stats_config.open_threshold_bps
+                if basis_bps <= trigger_basis_bps:
+                    continue
+                if not stats.allow_bbo_record(
+                    now_wall, futures_futures_stats_config.bbo_record_interval_ms / 1000
+                ):
+                    continue
+                ff_bbo_records.append((key, {
+                    "time": datetime.fromtimestamp(now_wall, timezone.utc).isoformat(),
+                    "source_market": "unified",
+                    "usdt_symbol": route.usdt_symbol,
+                    "usdc_symbol": route.usdc_symbol,
+                    "conversion_symbol": route.conversion_symbol or None,
+                    "conversion_rate": conversion_rate,
+                    "usdt_bid": usdt.bid,
+                    "usdt_ask": usdt.ask,
+                    "usdt_mid": usdt.mid,
+                    "usdc_bid": usdc.bid,
+                    "usdc_ask": usdc.ask,
+                    "usdc_mid": usdc.mid,
+                    "normalized_usdc_mid": normalized_usdc_mid,
+                    "mean_basis_bps": stats.mean_basis_bps,
+                    "standard_deviation_bps": stats.standard_deviation_bps,
+                    "trigger_basis_bps": trigger_basis_bps,
+                    "basis_bps": basis_bps,
+                    "deviation_bps": basis_bps - stats.mean_basis_bps,
+                }))
+            if ff_bbo_records:
+                futures_futures_store.append_bbo_records(ff_bbo_records)
 
             if now_mono - last_persist >= runtime.persist_interval_seconds:
                 store.save_states(engine.eligible_rows(filters.positive_basis_only))
