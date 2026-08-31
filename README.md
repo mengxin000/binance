@@ -8,6 +8,10 @@
 
 24小时 ticker 只用于现货与永续成交额初筛。价格使用双方实时 bookTicker：
 
+每个统计周期只读取各市场当前最新的 bookTicker。所有腿的本机接收年龄和接收时间差都达标时，基差才进入均值、总体标准差和分位数统计；否则跳过本次采样。被拒绝的基差会与2秒内出现的下一条合格基差进行复核，变化至少3bp时限频写入 `data/diagnostics/basis_recheck.jsonl`。
+
+跨现货和永续流的对齐使用本机 `time.monotonic()` 接收时间，因为现货 bookTicker 没有可与永续统一比较的交易所事件时间。接收时间在 WebSocket 消息返回后、JSON解析前立即记录；永续返回的交易所事件时间同时保留在诊断记录中，但不作为跨市场对齐时钟。
+
 ```text
 spot_mid = (spot_bid + spot_ask) / 2
 futures_mid = (futures_bid + futures_ask) / 2
@@ -85,12 +89,13 @@ spread_bps = (USDC永续折算价 / USDT永续mid - 1) × 10000
 
 ```json
 {
-  "sample_interval_ms": 200,
+  "sample_interval_ms": 1000,
   "display_refresh_seconds": 1.0,
   "stale_seconds": 10.0,
+  "quote_max_age_ms": 1000,
+  "quote_match_tolerance_ms": 200,
   "persist_interval_seconds": 60.0,
-  "data_directory": "data",
-  "bbo_queue_maxsize": 20000
+  "data_directory": "data"
 }
 ```
 

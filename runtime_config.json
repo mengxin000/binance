@@ -2,7 +2,8 @@
   "sample_interval_ms": 1000,
   "display_refresh_seconds": 1.0,
   "stale_seconds": 10.0,
+  "quote_max_age_ms": 1000,
+  "quote_match_tolerance_ms": 200,
   "persist_interval_seconds": 60.0,
-  "data_directory": "data",
-  "bbo_queue_maxsize": 20000
+  "data_directory": "data"
 }

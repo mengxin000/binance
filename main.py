@@ -119,19 +119,26 @@ class RuntimeConfig:
     sample_interval_ms: int = 200
     display_refresh_seconds: float = 1.0
     stale_seconds: float = 2.0
+    quote_max_age_ms: int = 1000
+    quote_match_tolerance_ms: int = 200
     persist_interval_seconds: float = 60.0
     data_directory: str = "data"
-    bbo_queue_maxsize: int = 20_000
 
     def validate(self) -> None:
         if not isinstance(self.sample_interval_ms, int) or self.sample_interval_ms < 50:
             raise ValueError("sample_interval_ms 必须是至少 50 的整数")
         if self.display_refresh_seconds <= 0 or self.stale_seconds <= 0:
             raise ValueError("显示刷新和行情过期时间必须大于 0")
+        if not isinstance(self.quote_max_age_ms, int) or self.quote_max_age_ms < 1:
+            raise ValueError("quote_max_age_ms 必须是大于 0 的整数")
+        if (
+            not isinstance(self.quote_match_tolerance_ms, int)
+            or self.quote_match_tolerance_ms < 0
+            or self.quote_match_tolerance_ms > self.quote_max_age_ms
+        ):
+            raise ValueError("quote_match_tolerance_ms 必须是 0 到 quote_max_age_ms 之间的整数")
         if self.persist_interval_seconds <= 0 or not self.data_directory.strip():
             raise ValueError("持久化间隔必须大于 0，数据目录不能为空")
-        if not isinstance(self.bbo_queue_maxsize, int) or self.bbo_queue_maxsize < 100:
-            raise ValueError("bbo_queue_maxsize 必须是至少为 100 的整数")
 
 
 ConfigT = TypeVar("ConfigT")
@@ -182,6 +189,7 @@ class BookQuote:
     bid: float
     ask: float
     received_at: float
+    exchange_event_time_ms: int | None = None
 
     @property
     def mid(self) -> float:
@@ -198,6 +206,9 @@ class PairSnapshot:
     futures_symbol: str = ""
     conversion_rate: float = 1.0
     market_type: str = "spot_futures"
+    quote_skew_ms: float = 0.0
+    leg_ages_ms: tuple[float, ...] = ()
+    exchange_event_times_ms: tuple[int | None, ...] = ()
 
 
 @dataclass(slots=True)
@@ -268,13 +279,14 @@ class FuturesFuturesRoute:
 
 # 显示状态栏
 class MarketState:
-    def __init__(self, bbo_queue_maxsize: int = 20_000) -> None:
+    def __init__(self) -> None:
         self.quote_assets: frozenset[str] = frozenset({"USDT"})
         self.cross_quote_pairings: tuple[tuple[str, str], ...] = ()
         self.spot_volumes: dict[str, VolumeTicker] = {}
         self.futures_volumes: dict[str, VolumeTicker] = {}
         self.spot_books: dict[str, BookQuote] = {}
         self.futures_books: dict[str, BookQuote] = {}
+        self.quote_rejections: list[dict[str, Any]] = []
         self.active_routes: dict[str, PairRoute] = {}
         # 移除 BBO 队列，改为在主循环定时采样时统一处理
         self.routes_version: int = 0
@@ -300,7 +312,9 @@ class MarketState:
             destination[symbol] = VolumeTicker(quote_volume)
         self.ticker_last_update[market] = time.monotonic()
 
-    def update_book(self, market: str, row: dict[str, Any]) -> None:
+    def update_book(
+        self, market: str, row: dict[str, Any], received_at: float | None = None
+    ) -> None:
         try:
             symbol = str(row["s"])
             bid, ask = float(row["b"]), float(row["a"])
@@ -308,15 +322,16 @@ class MarketState:
             return
         if bid <= 0 or ask <= 0 or ask < bid:
             return
-        now = time.monotonic()
+        now = time.monotonic() if received_at is None else received_at
         destination = self.spot_books if market == "spot" else self.futures_books
-        # 价格连续性检查：单次跳变超过 10% 视为脏数据，拒绝更新
-        old_quote = destination.get(symbol)
-        if old_quote is not None and old_quote.mid > 0:
-            new_mid = (bid + ask) / 2
-            if abs(new_mid / old_quote.mid - 1) > 0.10:
-                return
-        destination[symbol] = BookQuote(bid, ask, now)
+        event_time = row.get("E")
+        exchange_event_time_ms = (
+            int(event_time)
+            if isinstance(event_time, (int, float)) and not isinstance(event_time, bool)
+            else None
+        )
+        quote = BookQuote(bid, ask, now, exchange_event_time_ms)
+        destination[symbol] = quote
         self.book_last_update[market] = now
 
     def _split_symbol(self, symbol: str) -> tuple[str, str] | None:
@@ -422,14 +437,21 @@ class MarketState:
         assets = set(filters.quote_assets)
         for spot_quote, futures_quote in cross:
             assets.update((spot_quote, futures_quote))
-        self.quote_assets = frozenset(assets)
-        self.cross_quote_pairings = cross
-        self.routes_version += 1
+        updated_assets = frozenset(assets)
+        if (
+            updated_assets != self.quote_assets
+            or cross != self.cross_quote_pairings
+        ):
+            self.quote_assets = updated_assets
+            self.cross_quote_pairings = cross
+            self.routes_version += 1
 
     def set_quote_assets(self, quote_assets: tuple[str, ...] | list[str]) -> None:
-        self.quote_assets = frozenset(quote_assets)
-        self.cross_quote_pairings = ()
-        self.routes_version += 1
+        updated_assets = frozenset(quote_assets)
+        if updated_assets != self.quote_assets or self.cross_quote_pairings:
+            self.quote_assets = updated_assets
+            self.cross_quote_pairings = ()
+            self.routes_version += 1
 
     def is_allowed_symbol(self, symbol: str) -> bool:
         return any(symbol.endswith(asset) for asset in self.quote_assets)
@@ -485,6 +507,43 @@ class MarketState:
         rate = 1 / quote.mid if route.conversion_inverted else quote.mid
         return rate, quote.received_at
 
+    @staticmethod
+    def _quote_quality(
+        quotes: list[BookQuote], now: float, max_age_seconds: float,
+        tolerance_seconds: float,
+    ) -> tuple[bool, str, tuple[float, ...], float]:
+        ages = tuple((now - quote.received_at) * 1000 for quote in quotes)
+        received_at = [quote.received_at for quote in quotes]
+        skew_ms = (max(received_at) - min(received_at)) * 1000
+        if max(ages) > max_age_seconds * 1000:
+            return False, "quote_age", ages, skew_ms
+        if skew_ms > tolerance_seconds * 1000:
+            return False, "quote_skew", ages, skew_ms
+        return True, "", ages, skew_ms
+
+    def _record_quote_rejection(
+        self, market_type: str, symbol: str, basis_bps: float,
+        reason: str, ages_ms: tuple[float, ...], skew_ms: float,
+        quotes: list[BookQuote],
+    ) -> None:
+        self.quote_rejections.append({
+            "market_type": market_type,
+            "symbol": symbol,
+            "rejected_at_wall": time.time(),
+            "rejected_at_mono": time.monotonic(),
+            "rejected_basis_bps": basis_bps,
+            "reason": reason,
+            "raw_quote_skew_ms": skew_ms,
+            "raw_leg_ages_ms": list(ages_ms),
+            "exchange_event_times_ms": [
+                quote.exchange_event_time_ms for quote in quotes
+            ],
+        })
+
+    def drain_quote_rejections(self) -> list[dict[str, Any]]:
+        rows, self.quote_rejections = self.quote_rejections, []
+        return rows
+
     def _bbo_snapshot(self, route: PairRoute, source_market: str) -> BboSnapshot | None:
         spot = self.spot_books.get(route.spot_symbol)
         futures = self.futures_books.get(route.futures_symbol)
@@ -499,23 +558,33 @@ class MarketState:
             rate, route.conversion_symbol, conversion_received_at,
         )
 
-    def get_bbo_snapshot(self, route: PairRoute, stale_seconds: float) -> BboSnapshot | None:
-        """在主循环统一采样点生成对齐的 BBO 快照，替代在 websocket 回调中分散生成。"""
+    def get_bbo_snapshot(
+        self, route: PairRoute, max_age_seconds: float,
+        tolerance_seconds: float = 0.2,
+    ) -> BboSnapshot | None:
+        """仅使用当前最新且时间质量达标的 BBO。"""
         spot = self.spot_books.get(route.spot_symbol)
         futures = self.futures_books.get(route.futures_symbol)
-        conversion = self._conversion_rate(route)
-        if spot is None or futures is None or conversion is None:
+        conversion = (
+            self.spot_books.get(route.conversion_symbol)
+            if route.conversion_symbol else None
+        )
+        if spot is None or futures is None or (route.conversion_symbol and conversion is None):
             return None
-        rate, conversion_received_at = conversion
-        now = time.monotonic()
-        ages = [now - spot.received_at, now - futures.received_at]
-        if route.conversion_symbol:
-            ages.append(now - conversion_received_at)
-        if max(ages) > stale_seconds:
+        quotes = [spot, futures] + ([conversion] if conversion is not None else [])
+        valid, _, _, _ = self._quote_quality(
+            quotes, time.monotonic(), max_age_seconds, tolerance_seconds
+        )
+        if not valid:
             return None
-        # 三腿时间对齐检查：各 leg 接收时间差超过 500ms 视为未对齐，拒绝采样
-        if len(ages) >= 2 and max(ages) - min(ages) > 0.5:
-            return None
+        rate = 1.0
+        conversion_received_at = 0.0
+        if conversion is not None:
+            rate = (
+                1 / conversion.mid
+                if route.conversion_inverted else conversion.mid
+            )
+            conversion_received_at = conversion.received_at
         return BboSnapshot(
             route.key, route.spot_symbol, route.futures_symbol,
             "unified", time.time(),
@@ -539,8 +608,12 @@ class MarketState:
             for updated in (*self.ticker_last_update.values(), *self.book_last_update.values())
         )
 
-    def snapshots(self, filters: FilterConfig, stale_seconds: float) -> list[PairSnapshot]:
-        if not self.streams_healthy(stale_seconds):
+    def snapshots(
+        self, filters: FilterConfig, max_age_seconds: float,
+        tolerance_seconds: float = 0.2,
+        stream_stale_seconds: float | None = None,
+    ) -> list[PairSnapshot]:
+        if not self.streams_healthy(stream_stale_seconds or max_age_seconds):
             return []
         now = time.monotonic()
         result: list[PairSnapshot] = []
@@ -549,30 +622,49 @@ class MarketState:
             route = routes[key]
             spot = self.spot_books.get(route.spot_symbol)
             futures = self.futures_books.get(route.futures_symbol)
-            conversion = self._conversion_rate(route)
-            if not spot or not futures or conversion is None:
+            conversion_quote = (
+                self.spot_books.get(route.conversion_symbol)
+                if route.conversion_symbol else None
+            )
+            if spot is None or futures is None or (
+                route.conversion_symbol and conversion_quote is None
+            ):
                 continue
-            rate, conversion_received_at = conversion
-            ages = [now - spot.received_at, now - futures.received_at]
-            if route.conversion_symbol:
-                ages.append(now - conversion_received_at)
-            if max(ages) > stale_seconds:
-                continue
-            # 三腿时间对齐检查
-            if len(ages) >= 2 and max(ages) - min(ages) > 0.5:
-                continue
+            rate = 1.0
+            if conversion_quote is not None:
+                rate = (
+                    1 / conversion_quote.mid
+                    if route.conversion_inverted else conversion_quote.mid
+                )
             spot_mid, futures_mid = spot.mid, futures.mid * rate
+            basis_bps = (futures_mid / spot_mid - 1) * 10_000
+            quotes = [spot, futures] + (
+                [conversion_quote] if conversion_quote is not None else []
+            )
+            valid, reason, ages_ms, skew_ms = self._quote_quality(
+                quotes, now, max_age_seconds, tolerance_seconds
+            )
+            if not valid:
+                self._record_quote_rejection(
+                    "spot_futures", key, basis_bps, reason,
+                    ages_ms, skew_ms, quotes,
+                )
+                continue
             result.append(PairSnapshot(
                 key, spot_mid, futures_mid,
-                (futures_mid / spot_mid - 1) * 10_000,
+                basis_bps,
                 route.spot_symbol, route.futures_symbol, rate,
+                "spot_futures", skew_ms, ages_ms,
+                tuple(quote.exchange_event_time_ms for quote in quotes),
             ))
         return result
 
     def futures_futures_snapshots(
-        self, filters: FilterConfig, stale_seconds: float
+        self, filters: FilterConfig, max_age_seconds: float,
+        tolerance_seconds: float = 0.2,
+        stream_stale_seconds: float | None = None,
     ) -> list[PairSnapshot]:
-        if not self.streams_healthy(stale_seconds):
+        if not self.streams_healthy(stream_stale_seconds or max_age_seconds):
             return []
         now = time.monotonic()
         result: list[PairSnapshot] = []
@@ -580,32 +672,35 @@ class MarketState:
             usdt = self.futures_books.get(route.usdt_symbol)
             usdc = self.futures_books.get(route.usdc_symbol)
             conversion_book = self.spot_books.get(route.conversion_symbol)
-            if not usdt or not usdc or not conversion_book or conversion_book.mid <= 0:
+            if usdt is None or usdc is None or conversion_book is None:
                 continue
             conversion_rate = (
                 1 / conversion_book.mid
                 if route.conversion_inverted else conversion_book.mid
             )
-            ages = [
-                now - usdt.received_at,
-                now - usdc.received_at,
-                now - conversion_book.received_at,
-            ]
-            if max(ages) > stale_seconds:
-                continue
-            # 三腿时间对齐检查
-            if max(ages) - min(ages) > 0.5:
-                continue
             normalized_usdc_mid = usdc.mid * conversion_rate
+            basis_bps = (normalized_usdc_mid / usdt.mid - 1) * 10_000
+            quotes = [usdt, usdc, conversion_book]
+            valid, reason, ages_ms, skew_ms = self._quote_quality(
+                quotes, now, max_age_seconds, tolerance_seconds
+            )
+            if not valid:
+                self._record_quote_rejection(
+                    "futures_futures", route.key, basis_bps, reason,
+                    ages_ms, skew_ms, quotes,
+                )
+                continue
             result.append(PairSnapshot(
                 route.key,
                 usdt.mid,
                 normalized_usdc_mid,
-                (normalized_usdc_mid / usdt.mid - 1) * 10_000,
+                basis_bps,
                 route.usdt_symbol,
                 route.usdc_symbol,
                 conversion_rate,
                 "futures_futures",
+                skew_ms, ages_ms,
+                tuple(quote.exchange_event_time_ms for quote in quotes),
             ))
         return result
 
@@ -685,10 +780,8 @@ class PairStatistics:
     sample_count: int = 0
     observed_seconds: float = 0.0
     mean_basis_bps: float = 0.0
-    # Welford 在线算法状态（替代 rolling_sum / rolling_sum_squares，避免浮点精度灾难）
-    _welford_mean: float = 0.0
-    _welford_m2: float = 0.0
-    _last_basis_bps: float | None = None
+    rolling_sum: float = 0.0
+    rolling_sum_squares: float = 0.0
     current_spot_mid: float = 0.0
     current_futures_mid: float = 0.0
     current_basis_bps: float = 0.0
@@ -705,8 +798,10 @@ class PairStatistics:
     def standard_deviation_bps(self) -> float:
         if self.sample_count < 2:
             return 0.0
-        # 样本标准差（无偏估计）
-        variance = self._welford_m2 / (self.sample_count - 1)
+        variance = (
+            self.rolling_sum_squares / self.sample_count
+            - self.mean_basis_bps * self.mean_basis_bps
+        )
         return max(0.0, variance) ** 0.5
 
     @property
@@ -747,36 +842,20 @@ class PairStatistics:
             return None
         return min(self.basis_samples), max(self.basis_samples)
 
-    def _recompute_welford(self) -> None:
-        """从当前 basis_samples 重新计算 Welford 状态（用于 resize_window 后）。"""
-        self._welford_mean = 0.0
-        self._welford_m2 = 0.0
-        n = len(self.basis_samples)
-        self.sample_count = n
-        if n == 0:
-            self.mean_basis_bps = 0.0
-            return
-        for i, x in enumerate(self.basis_samples):
-            delta = x - self._welford_mean
-            self._welford_mean += delta / (i + 1)
-            delta2 = x - self._welford_mean
-            self._welford_m2 += delta * delta2
-        self.mean_basis_bps = self._welford_mean
-
     def resize_window(self, total_window_samples: int) -> None:
         while len(self.basis_samples) > total_window_samples:
-            self.basis_samples.popleft()
-        self._recompute_welford()
+            removed = self.basis_samples.popleft()
+            self.rolling_sum -= removed
+            self.rolling_sum_squares -= removed * removed
+        self.sample_count = len(self.basis_samples)
+        self.mean_basis_bps = (
+            self.rolling_sum / self.sample_count if self.sample_count else 0.0
+        )
 
     def _append_sample(self, basis_bps: float, total_window_samples: int) -> None:
         self.basis_samples.append(basis_bps)
-        # Welford 增量更新
-        self.sample_count += 1
-        delta = basis_bps - self._welford_mean
-        self._welford_mean += delta / self.sample_count
-        delta2 = basis_bps - self._welford_mean
-        self._welford_m2 += delta * delta2
-        self.mean_basis_bps = self._welford_mean
+        self.rolling_sum += basis_bps
+        self.rolling_sum_squares += basis_bps * basis_bps
         self.resize_window(total_window_samples)
 
     def update(
@@ -790,40 +869,7 @@ class PairStatistics:
         previous_mean = self.mean_basis_bps
         previous_sigma = self.standard_deviation_bps
 
-        # ── 异常值过滤层 ──
         events: list[dict[str, Any]] = []
-        if self.sample_count >= 10:
-            # 1. Z-Score 过滤：与历史均值偏差超过 5σ 视为异常
-            if previous_sigma > 0:
-                z_score = abs(current_basis_bps - previous_mean) / previous_sigma
-                if z_score > 5.0:
-                    events.append({
-                        "event": "anomaly_rejected",
-                        "market_type": snapshot.market_type,
-                        "time": datetime.fromtimestamp(now_wall, timezone.utc).isoformat(),
-                        "symbol": self.symbol,
-                        "basis_bps": current_basis_bps,
-                        "mean_basis_bps": previous_mean,
-                        "standard_deviation_bps": previous_sigma,
-                        "z_score": round(z_score, 2),
-                        "reason": "z_score_exceeds_5",
-                    })
-                    return events
-            # 2. 连续性过滤：相邻样本 basis 跳变超过 500bps（5%）视为异常
-            if self._last_basis_bps is not None:
-                jump = abs(current_basis_bps - self._last_basis_bps)
-                if jump > 500.0:
-                    events.append({
-                        "event": "anomaly_rejected",
-                        "market_type": snapshot.market_type,
-                        "time": datetime.fromtimestamp(now_wall, timezone.utc).isoformat(),
-                        "symbol": self.symbol,
-                        "basis_bps": current_basis_bps,
-                        "last_basis_bps": self._last_basis_bps,
-                        "jump_bps": round(jump, 2),
-                        "reason": "basis_jump_exceeds_500bps",
-                    })
-                    return events
 
         self.current_spot_mid = snapshot.spot_mid
         self.current_futures_mid = snapshot.futures_mid
@@ -831,7 +877,6 @@ class PairStatistics:
         self.current_deviation_bps = (
             current_basis_bps - previous_mean if self.sample_count else 0.0
         )
-        self._last_basis_bps = current_basis_bps
 
         if self.sample_count:
             if not self.upper_excursion_active and self.current_deviation_bps >= config.open_threshold_bps:
@@ -882,13 +927,7 @@ class PairStatistics:
                     "opportunity_number": self.close_count,
                 })
 
-        # ── observed_seconds 修复：使用实际 wall time 差值，而非固定间隔 ──
-        if self.last_sample_at is not None:
-            actual_interval = now_wall - self.last_sample_at
-            # 上限保护：防止时钟跳变或长时间阻塞导致极端值
-            self.observed_seconds += min(actual_interval, sample_interval_seconds * 3)
-        else:
-            self.observed_seconds += sample_interval_seconds
+        self.observed_seconds += sample_interval_seconds
 
         self._append_sample(current_basis_bps, config.total_window_samples)
         self.last_sample_at = now_wall
@@ -956,6 +995,79 @@ class PairDirectoryStore:
                 for row in rows:
                     handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
                 handle.flush()
+
+
+class BasisDiagnosticStore:
+    """用下一条合格报价复核因年龄或时差被拒绝的最新报价。"""
+
+    def __init__(self, root: Path, threshold_bps: float = 3.0) -> None:
+        self.root = root
+        self.threshold_bps = threshold_bps
+        self.last_record_at: dict[str, float] = {}
+        self.pending: dict[str, dict[str, Any]] = {}
+
+    def process(
+        self, rejections: list[dict[str, Any]],
+        snapshots: list[PairSnapshot], now_wall: float,
+    ) -> None:
+        for rejection in rejections:
+            key = f"{rejection['market_type']}:{rejection['symbol']}"
+            self.pending[key] = rejection
+
+        rows: list[dict[str, Any]] = []
+        for snapshot in snapshots:
+            key = f"{snapshot.market_type}:{snapshot.symbol}"
+            rejection = self.pending.pop(key, None)
+            if rejection is None:
+                continue
+            confirmation_delay_ms = (
+                time.monotonic() - rejection["rejected_at_mono"]
+            ) * 1000
+            if confirmation_delay_ms > 2000:
+                continue
+            difference = rejection["rejected_basis_bps"] - snapshot.basis_bps
+            if abs(difference) < self.threshold_bps:
+                continue
+            if now_wall - self.last_record_at.get(key, 0.0) < 10.0:
+                continue
+            self.last_record_at[key] = now_wall
+            rows.append({
+                "rejected_time": datetime.fromtimestamp(
+                    rejection["rejected_at_wall"], timezone.utc
+                ).isoformat(),
+                "confirmed_time": datetime.fromtimestamp(
+                    now_wall, timezone.utc
+                ).isoformat(),
+                "market_type": snapshot.market_type,
+                "symbol": snapshot.symbol,
+                "rejection_reason": rejection["reason"],
+                "rejected_basis_bps": rejection["rejected_basis_bps"],
+                "next_aligned_basis_bps": snapshot.basis_bps,
+                "reversion_bps": difference,
+                "confirmation_delay_ms": confirmation_delay_ms,
+                "rejected_quote_skew_ms": rejection["raw_quote_skew_ms"],
+                "rejected_leg_ages_ms": rejection["raw_leg_ages_ms"],
+                "aligned_quote_skew_ms": snapshot.quote_skew_ms,
+                "aligned_leg_ages_ms": list(snapshot.leg_ages_ms),
+                "rejected_exchange_event_times_ms": rejection[
+                    "exchange_event_times_ms"
+                ],
+                "aligned_exchange_event_times_ms": list(
+                    snapshot.exchange_event_times_ms
+                ),
+            })
+        if not rows:
+            return
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / "basis_recheck.jsonl").open(
+            "a", encoding="utf-8", newline="\n"
+        ) as handle:
+            for row in rows:
+                handle.write(
+                    json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+                )
+            handle.flush()
+
 
 # 分析
 class StatisticsEngine:
@@ -1067,10 +1179,12 @@ async def consume_books(
                 delay = 1.0
                 last_check = time.monotonic()
                 while not stop.is_set():
-                    payload = json.loads(await asyncio.wait_for(websocket.recv(), timeout=45))
+                    message = await asyncio.wait_for(websocket.recv(), timeout=45)
+                    received_at = time.monotonic()
+                    payload = json.loads(message)
                     row = payload.get("data") if isinstance(payload, dict) else None
                     if isinstance(row, dict):
-                        state.update_book(market, row)
+                        state.update_book(market, row, received_at)
                     if time.monotonic() - last_check >= 10:
                         # 检查 symbol 列表变化或 routes 版本变化（配置热加载）
                         if (
@@ -1164,6 +1278,7 @@ def render(
         f"价格达标: {len(state.eligible_symbols(filters))} | "
         f"入选统计: {len(rows)} | 正基差筛选: {'开启' if filters.positive_basis_only else '关闭'} | "
         f"采样周期: {runtime.sample_interval_ms}ms | 本次运行: {format_duration(time.monotonic() - started_mono)}",
+        f"报价匹配: 最大年龄 {runtime.quote_max_age_ms}ms / 最大时差 {runtime.quote_match_tolerance_ms}ms",
         f"样本窗口: 总{stats_config.total_window_samples} / 长{stats_config.long_window_samples} / "
         f"短{stats_config.short_window_samples} | "
         f"初筛: {stats_config.sigma_multiplier:g}σ > {stats_config.min_k_sigma_bps:g}bp",
@@ -1274,6 +1389,7 @@ def render_futures_futures(
         f"成交额达标: {len(routes)} | 入选统计: {len(rows)} | "
         f"采样周期: {runtime.sample_interval_ms}ms | "
         f"本次运行: {format_duration(time.monotonic() - started_mono)}",
+        f"报价匹配: 最大年龄 {runtime.quote_max_age_ms}ms / 最大时差 {runtime.quote_match_tolerance_ms}ms",
         f"样本窗口: 总{stats_config.total_window_samples} / 长{stats_config.long_window_samples} / "
         f"短{stats_config.short_window_samples} | "
         f"初筛: {stats_config.sigma_multiplier:g}σ > {stats_config.min_k_sigma_bps:g}bp",
@@ -1384,9 +1500,10 @@ async def run() -> None:
     data_root = resolve_path(runtime_manager.current.data_directory)
     store = PairDirectoryStore(data_root / "spot_futures")
     futures_futures_store = PairDirectoryStore(data_root / "futures_futures")
+    diagnostic_store = BasisDiagnosticStore(data_root / "diagnostics")
     engine = StatisticsEngine(store.load())
     futures_futures_engine = StatisticsEngine(futures_futures_store.load())
-    state = MarketState(runtime_manager.current.bbo_queue_maxsize)
+    state = MarketState()
     stop = asyncio.Event()
     state.set_pairing_config(filter_manager.current)
     # 记录启动时间，time.monotonic()单增计数1，2，3...
@@ -1429,11 +1546,19 @@ async def run() -> None:
             )
             runtime = runtime_manager.current
             sample_interval = runtime.sample_interval_ms / 1000
+            quote_max_age = runtime.quote_max_age_ms / 1000
+            quote_tolerance = runtime.quote_match_tolerance_ms / 1000
             now_mono = time.monotonic()
             now_wall = time.time()
 
             # ── 现货-永续 统一采样 ──
-            snapshots = state.snapshots(filters, runtime.stale_seconds)
+            snapshots = state.snapshots(
+                filters, quote_max_age, quote_tolerance,
+                runtime.stale_seconds,
+            )
+            diagnostic_store.process(
+                state.drain_quote_rejections(), snapshots, now_wall
+            )
             opportunities = engine.update(snapshots, sample_interval, stats_config, now_wall)
             for symbol, opportunity in opportunities:
                 stats = engine.pairs[symbol]
@@ -1446,7 +1571,9 @@ async def run() -> None:
             for key, route in state.liquid_routes(filters).items():
                 if key not in eligible:
                     continue
-                bbo = state.get_bbo_snapshot(route, runtime.stale_seconds)
+                bbo = state.get_bbo_snapshot(
+                    route, quote_max_age, quote_tolerance
+                )
                 if bbo is None:
                     continue
                 stats = engine.pairs.get(bbo.symbol)
@@ -1484,7 +1611,12 @@ async def run() -> None:
 
             # ── 永续-永续 统一采样 ──
             futures_futures_snapshots = state.futures_futures_snapshots(
-                filters, runtime.stale_seconds
+                filters, quote_max_age, quote_tolerance,
+                runtime.stale_seconds,
+            )
+            diagnostic_store.process(
+                state.drain_quote_rejections(),
+                futures_futures_snapshots, now_wall,
             )
             futures_futures_opportunities = futures_futures_engine.update(
                 futures_futures_snapshots,
@@ -1510,7 +1642,10 @@ async def run() -> None:
                     now_mono_chk - usdc.received_at,
                     now_mono_chk - conversion_book.received_at,
                 ]
-                if max(ages) > runtime.stale_seconds or max(ages) - min(ages) > 0.5:
+                if (
+                    max(ages) > quote_max_age
+                    or max(ages) - min(ages) > quote_tolerance
+                ):
                     continue
                 conversion_rate = (
                     1 / conversion_book.mid

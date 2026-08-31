@@ -1,9 +1,11 @@
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 from main import (
+    BasisDiagnosticStore,
     BINANCE_WEBSOCKET_OPTIONS,
     ConfigManager,
     FilterConfig,
@@ -20,17 +22,15 @@ from main import (
 
 
 class PairStatisticsTests(unittest.TestCase):
-    def test_bbo_queue_drops_oldest_snapshot_when_full(self):
-        state = MarketState(bbo_queue_maxsize=2)
-        for market in ("spot", "futures"):
-            state.update_book(market, {"s": "BTCUSDT", "b": "100", "a": "102"})
-        state.update_book("spot", {"s": "BTCUSDT", "b": "101", "a": "103"})
-        state.update_book("futures", {"s": "BTCUSDT", "b": "102", "a": "104"})
-
-        self.assertEqual(state.bbo_updates.qsize(), 2)
-        self.assertEqual(state.bbo_dropped, 1)
-        snapshots = [state.bbo_updates.get_nowait(), state.bbo_updates.get_nowait()]
-        self.assertEqual(snapshots[-1].spot_mid, 102.0)
+    def test_route_version_only_changes_when_pairing_config_changes(self):
+        state = MarketState()
+        usdt = FilterConfig(quote_assets=("USDT",))
+        state.set_pairing_config(usdt)
+        version = state.routes_version
+        state.set_pairing_config(usdt)
+        self.assertEqual(state.routes_version, version)
+        state.set_pairing_config(FilterConfig(quote_assets=("USDT", "USDC")))
+        self.assertEqual(state.routes_version, version + 1)
 
     def test_online_mean(self):
         stats = PairStatistics("AAAUSDT")
@@ -129,6 +129,32 @@ class PairDirectoryStoreTests(unittest.TestCase):
             lines = (Path(directory) / "AAAUSDT" / "opportunities.jsonl").read_text().splitlines()
             self.assertEqual(len(lines), 1)
             self.assertEqual(json.loads(lines[0]), event)
+
+    def test_rejected_quote_is_rechecked_by_next_aligned_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = BasisDiagnosticStore(Path(directory))
+            now = 1000.0
+            rejection = {
+                "market_type": "spot_futures",
+                "symbol": "AAAUSDT",
+                "rejected_at_wall": now - 0.5,
+                "rejected_at_mono": time.monotonic() - 0.5,
+                "rejected_basis_bps": 12.0,
+                "reason": "quote_skew",
+                "raw_quote_skew_ms": 450.0,
+                "raw_leg_ages_ms": [20.0, 470.0],
+                "exchange_event_times_ms": [None, 123],
+            }
+            snapshot = PairSnapshot(
+                "AAAUSDT", 100, 100, 1.0,
+                market_type="spot_futures", quote_skew_ms=50.0,
+                leg_ages_ms=(40.0, 80.0),
+            )
+            store.process([rejection], [snapshot], now)
+            rows = (Path(directory) / "basis_recheck.jsonl").read_text().splitlines()
+            record = json.loads(rows[0])
+            self.assertEqual(record["reversion_bps"], 11.0)
+            self.assertEqual(record["rejection_reason"], "quote_skew")
 
 
 class MarketStateTests(unittest.TestCase):
@@ -243,7 +269,48 @@ class MarketStateTests(unittest.TestCase):
         state.ticker_connected = {"spot": True, "futures": True}
         state.book_connected = {"spot": True, "futures": True}
         state.spot_books["AAAUSDT"].received_at -= 20
-        self.assertEqual(state.snapshots(FilterConfig(), stale_seconds=10), [])
+        self.assertEqual(state.snapshots(FilterConfig(), max_age_seconds=10), [])
+
+    def test_mismatched_latest_quotes_are_skipped_until_both_legs_refresh(self):
+        state = MarketState()
+        state.update_tickers("spot", [{"s": "AAAUSDT", "q": "20000000"}])
+        state.update_tickers("futures", [{"s": "AAAUSDT", "q": "20000000"}])
+        state.update_book("spot", {"s": "AAAUSDT", "b": "100", "a": "100"})
+        state.update_book("futures", {"s": "AAAUSDT", "b": "100", "a": "100"})
+        state.spot_books["AAAUSDT"].received_at -= 0.5
+        state.futures_books["AAAUSDT"].received_at -= 0.5
+        state.update_book("spot", {"s": "AAAUSDT", "b": "101", "a": "101"})
+        state.ticker_connected = {"spot": True, "futures": True}
+        state.book_connected = {"spot": True, "futures": True}
+
+        rows = state.snapshots(
+            FilterConfig(), max_age_seconds=1, tolerance_seconds=0.2
+        )
+        self.assertEqual(rows, [])
+        rejections = state.drain_quote_rejections()
+        self.assertEqual(len(rejections), 1)
+        self.assertEqual(rejections[0]["reason"], "quote_skew")
+
+        state.update_book("futures", {"s": "AAAUSDT", "b": "101", "a": "101", "E": 123456})
+        rows = state.snapshots(
+            FilterConfig(), max_age_seconds=1, tolerance_seconds=0.2
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0].basis_bps, 0.0)
+        self.assertEqual(rows[0].exchange_event_times_ms, (None, 123456))
+
+    def test_real_regime_change_is_not_rejected_by_statistical_filter(self):
+        stats = PairStatistics("AAAUSDT")
+        config = StatisticsConfig(
+            total_window_samples=100, long_window_samples=50,
+            short_window_samples=20, open_threshold_bps=100,
+            close_threshold_bps=-100,
+        )
+        for index in range(10):
+            stats.update(PairSnapshot("AAAUSDT", 100, 100, 0.1 * index), 1000 + index, 1, config)
+        stats.update(PairSnapshot("AAAUSDT", 100, 100, 20.0), 1011, 1, config)
+        self.assertEqual(stats.sample_count, 11)
+        self.assertEqual(stats.current_basis_bps, 20.0)
 
 
 class ConfigManagerTests(unittest.TestCase):
