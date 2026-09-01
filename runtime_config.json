@@ -4,6 +4,10 @@
   "stale_seconds": 10.0,
   "quote_max_age_ms": 1000,
   "quote_match_tolerance_ms": 200,
+  "max_transport_lag_ms": 2000,
   "persist_interval_seconds": 60.0,
+  "quantile_refresh_seconds": 15.0,
+  "background_write_queue_size": 10000,
+  "book_symbols_per_connection": 80,
   "data_directory": "data"
 }

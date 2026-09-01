@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import queue
 import signal
+import threading
 import time
 import unicodedata
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -121,7 +124,11 @@ class RuntimeConfig:
     stale_seconds: float = 2.0
     quote_max_age_ms: int = 1000
     quote_match_tolerance_ms: int = 200
+    max_transport_lag_ms: int = 2000
     persist_interval_seconds: float = 60.0
+    quantile_refresh_seconds: float = 15.0
+    background_write_queue_size: int = 10_000
+    book_symbols_per_connection: int = 80
     data_directory: str = "data"
 
     def validate(self) -> None:
@@ -137,8 +144,22 @@ class RuntimeConfig:
             or self.quote_match_tolerance_ms > self.quote_max_age_ms
         ):
             raise ValueError("quote_match_tolerance_ms 必须是 0 到 quote_max_age_ms 之间的整数")
+        if not isinstance(self.max_transport_lag_ms, int) or self.max_transport_lag_ms < 500:
+            raise ValueError("max_transport_lag_ms 必须是至少 500 的整数")
         if self.persist_interval_seconds <= 0 or not self.data_directory.strip():
             raise ValueError("持久化间隔必须大于 0，数据目录不能为空")
+        if self.quantile_refresh_seconds <= 0:
+            raise ValueError("quantile_refresh_seconds 必须大于 0")
+        if (
+            not isinstance(self.background_write_queue_size, int)
+            or self.background_write_queue_size < 100
+        ):
+            raise ValueError("background_write_queue_size 必须是至少 100 的整数")
+        if (
+            not isinstance(self.book_symbols_per_connection, int)
+            or not 1 <= self.book_symbols_per_connection <= 200
+        ):
+            raise ValueError("book_symbols_per_connection 必须是 1 到 200 的整数")
 
 
 ConfigT = TypeVar("ConfigT")
@@ -190,10 +211,15 @@ class BookQuote:
     ask: float
     received_at: float
     exchange_event_time_ms: int | None = None
+    transport_lag_ms: float | None = None
 
     @property
     def mid(self) -> float:
         return (self.bid + self.ask) / 2
+
+
+class TransportLagError(RuntimeError):
+    """The socket is delivering exchange events too old to be useful."""
 
 
 @dataclass(slots=True)
@@ -287,11 +313,15 @@ class MarketState:
         self.spot_books: dict[str, BookQuote] = {}
         self.futures_books: dict[str, BookQuote] = {}
         self.quote_rejections: list[dict[str, Any]] = []
+        self.max_transport_lag_ms: float = 2000.0
         self.active_routes: dict[str, PairRoute] = {}
         # 移除 BBO 队列，改为在主循环定时采样时统一处理
         self.routes_version: int = 0
         self.ticker_connected = {"spot": False, "futures": False}
         self.book_connected = {"spot": False, "futures": False}
+        self.book_connected_chunks: dict[str, set[str]] = {
+            "spot": set(), "futures": set(),
+        }
         self.ticker_last_update = {"spot": 0.0, "futures": 0.0}
         self.book_last_update = {"spot": 0.0, "futures": 0.0}
         self.errors = {
@@ -313,7 +343,8 @@ class MarketState:
         self.ticker_last_update[market] = time.monotonic()
 
     def update_book(
-        self, market: str, row: dict[str, Any], received_at: float | None = None
+        self, market: str, row: dict[str, Any], received_at: float | None = None,
+        transport_lag_ms: float | None = None,
     ) -> None:
         try:
             symbol = str(row["s"])
@@ -330,7 +361,9 @@ class MarketState:
             if isinstance(event_time, (int, float)) and not isinstance(event_time, bool)
             else None
         )
-        quote = BookQuote(bid, ask, now, exchange_event_time_ms)
+        quote = BookQuote(
+            bid, ask, now, exchange_event_time_ms, transport_lag_ms
+        )
         destination[symbol] = quote
         self.book_last_update[market] = now
 
@@ -442,8 +475,12 @@ class MarketState:
             updated_assets != self.quote_assets
             or cross != self.cross_quote_pairings
         ):
+            assets_changed = updated_assets != self.quote_assets
             self.quote_assets = updated_assets
             self.cross_quote_pairings = cross
+            if assets_changed:
+                self._remove_disallowed_market_data()
+            self.active_routes.clear()
             self.routes_version += 1
 
     def set_quote_assets(self, quote_assets: tuple[str, ...] | list[str]) -> None:
@@ -451,7 +488,29 @@ class MarketState:
         if updated_assets != self.quote_assets or self.cross_quote_pairings:
             self.quote_assets = updated_assets
             self.cross_quote_pairings = ()
+            self._remove_disallowed_market_data()
+            self.active_routes.clear()
             self.routes_version += 1
+
+    def _remove_disallowed_market_data(self) -> None:
+        """Drop cached rows that no longer belong to the effective quote universe."""
+        for destination in (
+            self.spot_volumes, self.futures_volumes,
+            self.spot_books, self.futures_books,
+        ):
+            for symbol in list(destination):
+                if not self.is_allowed_symbol(symbol):
+                    destination.pop(symbol, None)
+
+    def set_book_chunk_connected(
+        self, market: str, connection_key: str, connected: bool
+    ) -> None:
+        chunks = self.book_connected_chunks[market]
+        if connected:
+            chunks.add(connection_key)
+        else:
+            chunks.discard(connection_key)
+        self.book_connected[market] = bool(chunks)
 
     def is_allowed_symbol(self, symbol: str) -> bool:
         return any(symbol.endswith(asset) for asset in self.quote_assets)
@@ -507,8 +566,8 @@ class MarketState:
         rate = 1 / quote.mid if route.conversion_inverted else quote.mid
         return rate, quote.received_at
 
-    @staticmethod
     def _quote_quality(
+        self,
         quotes: list[BookQuote], now: float, max_age_seconds: float,
         tolerance_seconds: float,
     ) -> tuple[bool, str, tuple[float, ...], float]:
@@ -517,6 +576,13 @@ class MarketState:
         skew_ms = (max(received_at) - min(received_at)) * 1000
         if max(ages) > max_age_seconds * 1000:
             return False, "quote_age", ages, skew_ms
+        transport_lags = [
+            quote.transport_lag_ms
+            for quote in quotes
+            if quote.transport_lag_ms is not None
+        ]
+        if transport_lags and max(transport_lags) > self.max_transport_lag_ms:
+            return False, "transport_lag", ages, skew_ms
         if skew_ms > tolerance_seconds * 1000:
             return False, "quote_skew", ages, skew_ms
         return True, "", ages, skew_ms
@@ -538,6 +604,7 @@ class MarketState:
             "exchange_event_times_ms": [
                 quote.exchange_event_time_ms for quote in quotes
             ],
+            "transport_lags_ms": [quote.transport_lag_ms for quote in quotes],
         })
 
     def drain_quote_rejections(self) -> list[dict[str, Any]]:
@@ -793,6 +860,12 @@ class PairStatistics:
     last_sample_at: float | None = None
     basis_samples: deque[float] = field(default_factory=deque, repr=False)
     last_bbo_record_at: float | None = None
+    quantile_cache: dict[tuple[int, float, float], tuple[float, float]] = field(
+        default_factory=dict, repr=False
+    )
+    sample_sequence: int = field(default=0, repr=False)
+    minimum_samples: deque[tuple[int, float]] = field(default_factory=deque, repr=False)
+    maximum_samples: deque[tuple[int, float]] = field(default_factory=deque, repr=False)
 
     @property
     def standard_deviation_bps(self) -> float:
@@ -830,6 +903,12 @@ class PairStatistics:
 
         return percentile(low), percentile(high)
 
+    def cached_quantile_range(
+        self, sample_size: int, low: float, high: float
+    ) -> tuple[float, float] | None:
+        """Return the last background-computed value without sorting here."""
+        return self.quantile_cache.get((sample_size, low, high))
+
     def allow_bbo_record(self, timestamp: float, interval_seconds: float) -> bool:
         if self.last_bbo_record_at is not None and timestamp - self.last_bbo_record_at < interval_seconds:
             return False
@@ -838,9 +917,20 @@ class PairStatistics:
 
     @property
     def runtime_range(self) -> tuple[float, float] | None:
-        if not self.basis_samples:
+        if not self.minimum_samples or not self.maximum_samples:
             return None
-        return min(self.basis_samples), max(self.basis_samples)
+        return self.minimum_samples[0][1], self.maximum_samples[0][1]
+
+    def _expire_range_samples(self) -> None:
+        if not self.basis_samples:
+            self.minimum_samples.clear()
+            self.maximum_samples.clear()
+            return
+        oldest_sequence = self.sample_sequence - len(self.basis_samples) + 1
+        while self.minimum_samples and self.minimum_samples[0][0] < oldest_sequence:
+            self.minimum_samples.popleft()
+        while self.maximum_samples and self.maximum_samples[0][0] < oldest_sequence:
+            self.maximum_samples.popleft()
 
     def resize_window(self, total_window_samples: int) -> None:
         while len(self.basis_samples) > total_window_samples:
@@ -851,9 +941,17 @@ class PairStatistics:
         self.mean_basis_bps = (
             self.rolling_sum / self.sample_count if self.sample_count else 0.0
         )
+        self._expire_range_samples()
 
     def _append_sample(self, basis_bps: float, total_window_samples: int) -> None:
+        self.sample_sequence += 1
         self.basis_samples.append(basis_bps)
+        while self.minimum_samples and self.minimum_samples[-1][1] >= basis_bps:
+            self.minimum_samples.pop()
+        self.minimum_samples.append((self.sample_sequence, basis_bps))
+        while self.maximum_samples and self.maximum_samples[-1][1] <= basis_bps:
+            self.maximum_samples.pop()
+        self.maximum_samples.append((self.sample_sequence, basis_bps))
         self.rolling_sum += basis_bps
         self.rolling_sum_squares += basis_bps * basis_bps
         self.resize_window(total_window_samples)
@@ -946,24 +1044,34 @@ class PairDirectoryStore:
         return {}
 
     def save_states(self, statistics: list[PairStatistics]) -> None:
+        self.save_state_rows(self.snapshot_states(statistics))
+
+    @staticmethod
+    def snapshot_states(statistics: list[PairStatistics]) -> list[tuple[str, dict[str, Any]]]:
+        """Copy mutable statistics before handing them to the disk thread."""
+        rows: list[tuple[str, dict[str, Any]]] = []
         for stats in statistics:
-            pair_dir = self.root / stats.symbol
+            rows.append((stats.symbol, {
+                "sample_count": stats.sample_count,
+                "observed_seconds": stats.observed_seconds,
+                "mean_basis_bps": stats.mean_basis_bps,
+                "standard_deviation_bps": stats.standard_deviation_bps,
+                "current_spot_mid": stats.current_spot_mid,
+                "current_futures_mid": stats.current_futures_mid,
+                "current_basis_bps": stats.current_basis_bps,
+                "current_deviation_bps": stats.current_deviation_bps,
+                "open_count": stats.open_count,
+                "close_count": stats.close_count,
+                "upper_excursion_active": stats.upper_excursion_active,
+                "lower_excursion_active": stats.lower_excursion_active,
+                "last_sample_at": stats.last_sample_at,
+            }))
+        return rows
+
+    def save_state_rows(self, rows: list[tuple[str, dict[str, Any]]]) -> None:
+        for symbol, row in rows:
+            pair_dir = self.root / symbol
             pair_dir.mkdir(parents=True, exist_ok=True)
-            row = {
-                    "sample_count": stats.sample_count,
-                    "observed_seconds": stats.observed_seconds,
-                    "mean_basis_bps": stats.mean_basis_bps,
-                    "standard_deviation_bps": stats.standard_deviation_bps,
-                    "current_spot_mid": stats.current_spot_mid,
-                    "current_futures_mid": stats.current_futures_mid,
-                    "current_basis_bps": stats.current_basis_bps,
-                    "current_deviation_bps": stats.current_deviation_bps,
-                    "open_count": stats.open_count,
-                    "close_count": stats.close_count,
-                    "upper_excursion_active": stats.upper_excursion_active,
-                    "lower_excursion_active": stats.lower_excursion_active,
-                    "last_sample_at": stats.last_sample_at,
-            }
             target = pair_dir / "state.json"
             temporary = pair_dir / "state.json.tmp"
             temporary.write_text(
@@ -1008,8 +1116,8 @@ class BasisDiagnosticStore:
 
     def process(
         self, rejections: list[dict[str, Any]],
-        snapshots: list[PairSnapshot], now_wall: float,
-    ) -> None:
+        snapshots: list[PairSnapshot], now_wall: float, write: bool = True,
+    ) -> list[dict[str, Any]]:
         for rejection in rejections:
             key = f"{rejection['market_type']}:{rejection['symbol']}"
             self.pending[key] = rejection
@@ -1052,12 +1160,20 @@ class BasisDiagnosticStore:
                 "rejected_exchange_event_times_ms": rejection[
                     "exchange_event_times_ms"
                 ],
+                "rejected_transport_lags_ms": rejection.get(
+                    "transport_lags_ms", []
+                ),
                 "aligned_exchange_event_times_ms": list(
                     snapshot.exchange_event_times_ms
                 ),
             })
         if not rows:
-            return
+            return []
+        if write:
+            self.append_rows(rows)
+        return rows
+
+    def append_rows(self, rows: list[dict[str, Any]]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root / "basis_recheck.jsonl").open(
             "a", encoding="utf-8", newline="\n"
@@ -1067,6 +1183,140 @@ class BasisDiagnosticStore:
                     json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
                 )
             handle.flush()
+
+
+class BackgroundWriter:
+    """Single bounded disk queue; market-data tasks never perform filesystem I/O."""
+
+    def __init__(self, maxsize: int) -> None:
+        self._queue: queue.Queue[tuple[Any, tuple[Any, ...]] | None] = queue.Queue(maxsize)
+        self._thread = threading.Thread(target=self._run, name="disk-writer", daemon=True)
+        self.dropped_records = 0
+        self.last_error = ""
+        self._thread.start()
+
+    def submit(self, function: Any, *args: Any, droppable: bool = False) -> bool:
+        item = (function, args)
+        try:
+            self._queue.put_nowait(item)
+            return True
+        except queue.Full:
+            if droppable:
+                self.dropped_records += 1
+                return False
+            # Opportunity/state records are rare and important. Reserve a brief bounded wait.
+            try:
+                self._queue.put(item, timeout=0.05)
+                return True
+            except queue.Full:
+                self.dropped_records += 1
+                return False
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                function, args = item
+                function(*args)
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+            finally:
+                self._queue.task_done()
+
+    def close(self) -> None:
+        self._queue.join()
+        self._queue.put(None)
+        self._thread.join(timeout=5)
+
+
+class LatestScreenWriter:
+    """Capacity-one terminal slot: a slow console drops old frames, never market data."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._latest: str | None = None
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, name="terminal-writer", daemon=True)
+        self._thread.start()
+
+    def publish(self, screen: str) -> None:
+        with self._condition:
+            self._latest = screen
+            self._condition.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(lambda: self._latest is not None or self._closed)
+                if self._closed and self._latest is None:
+                    return
+                screen, self._latest = self._latest, None
+            print("\x1b[2J\x1b[H" + (screen or ""), end="", flush=True)
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify()
+        self._thread.join(timeout=5)
+
+
+def _percentile_range(values: list[float], low: float, high: float) -> tuple[float, float]:
+    values.sort()
+
+    def percentile(q: float) -> float:
+        position = q * (len(values) - 1)
+        left = int(position)
+        right = min(left + 1, len(values) - 1)
+        weight = position - left
+        return values[left] * (1 - weight) + values[right] * weight
+
+    return percentile(low), percentile(high)
+
+
+class QuantileWorker:
+    """At most one quantile job may exist; obsolete calculations never queue up."""
+
+    def __init__(self) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="quantiles")
+        self._future: Future[list[tuple[PairStatistics, tuple[int, float, float], tuple[float, float]]]] | None = None
+
+    def collect(self) -> None:
+        if self._future is None or not self._future.done():
+            return
+        try:
+            for stats, key, result in self._future.result():
+                stats.quantile_cache[key] = result
+        finally:
+            self._future = None
+
+    def schedule(self, jobs: list[tuple[PairStatistics, StatisticsConfig]]) -> bool:
+        self.collect()
+        if self._future is not None:
+            return False
+        snapshots: list[tuple[PairStatistics, list[float], tuple[int, float, float]]] = []
+        for stats, config in jobs:
+            values = list(stats.basis_samples)
+            for sample_size in (config.short_window_samples, config.long_window_samples):
+                count = min(sample_size, len(values))
+                if count:
+                    key = (sample_size, config.quantile_low, config.quantile_high)
+                    snapshots.append((stats, values[-count:], key))
+
+        def calculate() -> list[tuple[PairStatistics, tuple[int, float, float], tuple[float, float]]]:
+            return [
+                (stats, key, _percentile_range(values, key[1], key[2]))
+                for stats, values, key in snapshots
+            ]
+
+        self._future = self._executor.submit(calculate)
+        return True
+
+    def close(self) -> None:
+        self.collect()
+        self._executor.shutdown(wait=True, cancel_futures=True)
+        self.collect()
 
 
 # 分析
@@ -1150,49 +1400,68 @@ async def consume_tickers(url: str, market: str, state: MarketState, stop: async
     state.ticker_connected[market] = False
 
 
-async def consume_books(
+async def consume_book_chunk(
+    url: str,
     market: str,
+    connection_key: str,
     state: MarketState,
-    filter_manager: ConfigManager[FilterConfig],
     stop: asyncio.Event,
 ) -> None:
-    base_url = SPOT_BOOK_BASE if market == "spot" else FUTURES_BOOK_BASE
-    error_key = f"{market}_book"
     delay = 1.0
-    last_routes_version = -1
+    error_key = f"{market}_book_{connection_key}"
     while not stop.is_set():
-        symbols = state.book_symbols(market, filter_manager.current)
-        if not symbols:
-            try:
-                await asyncio.wait_for(stop.wait(), timeout=1)
-            except asyncio.TimeoutError:
-                pass
-            continue
-        last_routes_version = state.routes_version
-        streams = "/".join(f"{symbol.lower()}@bookTicker" for symbol in sorted(symbols))
         try:
-            async with websockets.connect(
-                base_url + streams, **BINANCE_WEBSOCKET_OPTIONS,
-            ) as websocket:
-                state.book_connected[market] = True
+            last_heartbeat_event_ms: int | None = None
+            async with websockets.connect(url, **BINANCE_WEBSOCKET_OPTIONS) as websocket:
+                state.set_book_chunk_connected(market, connection_key, True)
                 state.errors[error_key] = ""
                 delay = 1.0
-                last_check = time.monotonic()
                 while not stop.is_set():
                     message = await asyncio.wait_for(websocket.recv(), timeout=45)
+                    # Capture arrival before JSON parsing; latest symbol slot is overwritten.
                     received_at = time.monotonic()
+                    received_wall_ms = time.time() * 1000
                     payload = json.loads(message)
                     row = payload.get("data") if isinstance(payload, dict) else None
+                    stream = str(payload.get("stream", "")) if isinstance(payload, dict) else ""
                     if isinstance(row, dict):
-                        state.update_book(market, row, received_at)
-                    if time.monotonic() - last_check >= 10:
-                        # 检查 symbol 列表变化或 routes 版本变化（配置热加载）
+                        event_time = row.get("E")
                         if (
-                            state.book_symbols(market, filter_manager.current) != symbols
-                            or state.routes_version != last_routes_version
+                            market == "spot"
+                            and stream.lower().endswith("@ticker")
+                            and isinstance(event_time, (int, float))
                         ):
-                            break
-                        last_check = time.monotonic()
+                            last_heartbeat_event_ms = int(event_time)
+                            heartbeat_lag_ms = max(
+                                0.0, received_wall_ms - last_heartbeat_event_ms
+                            )
+                            if heartbeat_lag_ms > state.max_transport_lag_ms:
+                                raise TransportLagError(
+                                    f"现货连接积压 {heartbeat_lag_ms:.0f}ms，"
+                                    f"上限 {state.max_transport_lag_ms:.0f}ms"
+                                )
+                            continue
+                        transport_event_ms = (
+                            int(event_time)
+                            if isinstance(event_time, (int, float))
+                            and not isinstance(event_time, bool)
+                            else last_heartbeat_event_ms
+                        )
+                        # Spot bookTicker has no E. Until the same socket has delivered
+                        # its timestamped ticker heartbeat, its BBO cannot be proven fresh.
+                        if transport_event_ms is None:
+                            continue
+                        transport_lag_ms = max(
+                            0.0, received_wall_ms - transport_event_ms
+                        )
+                        if transport_lag_ms > state.max_transport_lag_ms:
+                            raise TransportLagError(
+                                f"{market}连接积压 {transport_lag_ms:.0f}ms，"
+                                f"上限 {state.max_transport_lag_ms:.0f}ms"
+                            )
+                        state.update_book(
+                            market, row, received_at, transport_lag_ms
+                        )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1203,7 +1472,65 @@ async def consume_books(
                 pass
             delay = min(delay * 2, 30)
         finally:
-            state.book_connected[market] = False
+            state.set_book_chunk_connected(market, connection_key, False)
+
+
+async def consume_books(
+    market: str,
+    state: MarketState,
+    filter_manager: ConfigManager[FilterConfig],
+    runtime_manager: ConfigManager[RuntimeConfig],
+    stop: asyncio.Event,
+) -> None:
+    base_url = SPOT_BOOK_BASE if market == "spot" else FUTURES_BOOK_BASE
+    while not stop.is_set():
+        symbols = sorted(state.book_symbols(market, filter_manager.current))
+        if not symbols:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=1)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        routes_version = state.routes_version
+        chunk_size = runtime_manager.current.book_symbols_per_connection
+        chunks = [symbols[index:index + chunk_size] for index in range(0, len(symbols), chunk_size)]
+        state.errors[f"{market}_book"] = ""
+        for key in list(state.errors):
+            if key.startswith(f"{market}_book_"):
+                state.errors.pop(key, None)
+        tasks = [
+            asyncio.create_task(consume_book_chunk(
+                base_url + "/".join(
+                    [f"{symbol.lower()}@bookTicker" for symbol in chunk]
+                    + (["btcusdt@ticker"] if market == "spot" else [])
+                ),
+                market, str(index), state, stop,
+            ))
+            for index, chunk in enumerate(chunks, 1)
+        ]
+        try:
+            while not stop.is_set():
+                done, _ = await asyncio.wait(tasks, timeout=2)
+                if done:
+                    for task in done:
+                        exception = task.exception()
+                        if exception is not None:
+                            raise exception
+                    raise RuntimeError("bookTicker 子连接意外停止")
+                if (
+                    state.routes_version != routes_version
+                    or state.book_symbols(market, filter_manager.current) != set(symbols)
+                    or runtime_manager.current.book_symbols_per_connection != chunk_size
+                ):
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            state.errors[f"{market}_book"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def format_duration(seconds: float) -> str:
@@ -1278,7 +1605,8 @@ def render(
         f"价格达标: {len(state.eligible_symbols(filters))} | "
         f"入选统计: {len(rows)} | 正基差筛选: {'开启' if filters.positive_basis_only else '关闭'} | "
         f"采样周期: {runtime.sample_interval_ms}ms | 本次运行: {format_duration(time.monotonic() - started_mono)}",
-        f"报价匹配: 最大年龄 {runtime.quote_max_age_ms}ms / 最大时差 {runtime.quote_match_tolerance_ms}ms",
+        f"报价匹配: 最大年龄 {runtime.quote_max_age_ms}ms / 最大时差 {runtime.quote_match_tolerance_ms}ms / "
+        f"最大传输延迟 {runtime.max_transport_lag_ms}ms",
         f"样本窗口: 总{stats_config.total_window_samples} / 长{stats_config.long_window_samples} / "
         f"短{stats_config.short_window_samples} | "
         f"初筛: {stats_config.sigma_multiplier:g}σ > {stats_config.min_k_sigma_bps:g}bp",
@@ -1316,12 +1644,12 @@ def render(
             sigma = stats.standard_deviation_bps
             upper_sigma = stats.mean_basis_bps + stats_config.sigma_multiplier * sigma
             lower_sigma = stats.mean_basis_bps - stats_config.sigma_multiplier * sigma
-            short_quantiles = stats.quantile_range(
+            short_quantiles = stats.cached_quantile_range(
                 stats_config.short_window_samples,
                 stats_config.quantile_low,
                 stats_config.quantile_high,
             )
-            long_quantiles = stats.quantile_range(
+            long_quantiles = stats.cached_quantile_range(
                 stats_config.long_window_samples,
                 stats_config.quantile_low,
                 stats_config.quantile_high,
@@ -1389,7 +1717,8 @@ def render_futures_futures(
         f"成交额达标: {len(routes)} | 入选统计: {len(rows)} | "
         f"采样周期: {runtime.sample_interval_ms}ms | "
         f"本次运行: {format_duration(time.monotonic() - started_mono)}",
-        f"报价匹配: 最大年龄 {runtime.quote_max_age_ms}ms / 最大时差 {runtime.quote_match_tolerance_ms}ms",
+        f"报价匹配: 最大年龄 {runtime.quote_max_age_ms}ms / 最大时差 {runtime.quote_match_tolerance_ms}ms / "
+        f"最大传输延迟 {runtime.max_transport_lag_ms}ms",
         f"样本窗口: 总{stats_config.total_window_samples} / 长{stats_config.long_window_samples} / "
         f"短{stats_config.short_window_samples} | "
         f"初筛: {stats_config.sigma_multiplier:g}σ > {stats_config.min_k_sigma_bps:g}bp",
@@ -1422,12 +1751,12 @@ def render_futures_futures(
     if rows:
         for index, stats in enumerate(rows[: filters.top], 1):
             sigma = stats.standard_deviation_bps
-            short_quantiles = stats.quantile_range(
+            short_quantiles = stats.cached_quantile_range(
                 stats_config.short_window_samples,
                 stats_config.quantile_low,
                 stats_config.quantile_high,
             )
-            long_quantiles = stats.quantile_range(
+            long_quantiles = stats.cached_quantile_range(
                 stats_config.long_window_samples,
                 stats_config.quantile_low,
                 stats_config.quantile_high,
@@ -1501,6 +1830,9 @@ async def run() -> None:
     store = PairDirectoryStore(data_root / "spot_futures")
     futures_futures_store = PairDirectoryStore(data_root / "futures_futures")
     diagnostic_store = BasisDiagnosticStore(data_root / "diagnostics")
+    disk_writer = BackgroundWriter(runtime_manager.current.background_write_queue_size)
+    screen_writer = LatestScreenWriter()
+    quantile_worker = QuantileWorker()
     engine = StatisticsEngine(store.load())
     futures_futures_engine = StatisticsEngine(futures_futures_store.load())
     state = MarketState()
@@ -1518,10 +1850,14 @@ async def run() -> None:
     tasks = [
         asyncio.create_task(consume_tickers(SPOT_TICKER_STREAM, "spot", state, stop)),
         asyncio.create_task(consume_tickers(FUTURES_TICKER_STREAM, "futures", state, stop)),
-        asyncio.create_task(consume_books("spot", state, filter_manager, stop)),
-        asyncio.create_task(consume_books("futures", state, filter_manager, stop)),
+        asyncio.create_task(consume_books(
+            "spot", state, filter_manager, runtime_manager, stop
+        )),
+        asyncio.create_task(consume_books(
+            "futures", state, filter_manager, runtime_manager, stop
+        )),
     ]
-    last_display = last_persist = 0.0
+    last_display = last_persist = last_quantile = 0.0
     next_sample = time.monotonic()
     current_page = "spot_futures"
     try:
@@ -1545,6 +1881,7 @@ async def run() -> None:
                 futures_futures_stats_config.total_window_samples
             )
             runtime = runtime_manager.current
+            state.max_transport_lag_ms = runtime.max_transport_lag_ms
             sample_interval = runtime.sample_interval_ms / 1000
             quote_max_age = runtime.quote_max_age_ms / 1000
             quote_tolerance = runtime.quote_match_tolerance_ms / 1000
@@ -1556,14 +1893,20 @@ async def run() -> None:
                 filters, quote_max_age, quote_tolerance,
                 runtime.stale_seconds,
             )
-            diagnostic_store.process(
-                state.drain_quote_rejections(), snapshots, now_wall
+            diagnostic_rows = diagnostic_store.process(
+                state.drain_quote_rejections(), snapshots, now_wall, write=False
             )
+            if diagnostic_rows:
+                disk_writer.submit(
+                    diagnostic_store.append_rows, diagnostic_rows, droppable=True
+                )
             opportunities = engine.update(snapshots, sample_interval, stats_config, now_wall)
             for symbol, opportunity in opportunities:
                 stats = engine.pairs[symbol]
                 if not filters.positive_basis_only or stats.mean_basis_bps > 0:
-                    store.append_opportunity(symbol, opportunity)
+                    disk_writer.submit(
+                        store.append_opportunity, symbol, dict(opportunity)
+                    )
 
             # ── 现货-永续 BBO 记录（统一采样点生成，避免时间错配和队列丢弃偏差）──
             eligible = state.eligible_symbols(filters)
@@ -1607,17 +1950,23 @@ async def run() -> None:
                     "deviation_bps": bbo.basis_bps - stats.mean_basis_bps,
                 }))
             if bbo_records:
-                store.append_bbo_records(bbo_records)
+                disk_writer.submit(
+                    store.append_bbo_records, bbo_records, droppable=True
+                )
 
             # ── 永续-永续 统一采样 ──
             futures_futures_snapshots = state.futures_futures_snapshots(
                 filters, quote_max_age, quote_tolerance,
                 runtime.stale_seconds,
             )
-            diagnostic_store.process(
+            diagnostic_rows = diagnostic_store.process(
                 state.drain_quote_rejections(),
-                futures_futures_snapshots, now_wall,
+                futures_futures_snapshots, now_wall, write=False,
             )
+            if diagnostic_rows:
+                disk_writer.submit(
+                    diagnostic_store.append_rows, diagnostic_rows, droppable=True
+                )
             futures_futures_opportunities = futures_futures_engine.update(
                 futures_futures_snapshots,
                 sample_interval,
@@ -1625,7 +1974,10 @@ async def run() -> None:
                 now_wall,
             )
             for symbol, opportunity in futures_futures_opportunities:
-                futures_futures_store.append_opportunity(symbol, opportunity)
+                disk_writer.submit(
+                    futures_futures_store.append_opportunity,
+                    symbol, dict(opportunity),
+                )
 
             # ── 永续-永续 BBO 记录 ──
             ff_routes = state.liquid_futures_futures_routes(filters)
@@ -1684,14 +2036,35 @@ async def run() -> None:
                     "deviation_bps": basis_bps - stats.mean_basis_bps,
                 }))
             if ff_bbo_records:
-                futures_futures_store.append_bbo_records(ff_bbo_records)
+                disk_writer.submit(
+                    futures_futures_store.append_bbo_records,
+                    ff_bbo_records, droppable=True,
+                )
 
             if now_mono - last_persist >= runtime.persist_interval_seconds:
-                store.save_states(engine.eligible_rows(filters.positive_basis_only))
-                futures_futures_store.save_states(
-                    futures_futures_engine.eligible_rows(False)
+                disk_writer.submit(
+                    store.save_state_rows,
+                    store.snapshot_states(engine.eligible_rows(filters.positive_basis_only)),
+                    droppable=True,
+                )
+                disk_writer.submit(
+                    futures_futures_store.save_state_rows,
+                    futures_futures_store.snapshot_states(
+                        futures_futures_engine.eligible_rows(False)
+                    ),
+                    droppable=True,
                 )
                 last_persist = now_mono
+            quantile_worker.collect()
+            if now_mono - last_quantile >= runtime.quantile_refresh_seconds:
+                jobs = [
+                    (stats, stats_config) for stats in engine.pairs.values()
+                ] + [
+                    (stats, futures_futures_stats_config)
+                    for stats in futures_futures_engine.pairs.values()
+                ]
+                if quantile_worker.schedule(jobs):
+                    last_quantile = now_mono
             current_page = poll_page_toggle(current_page)
             if now_mono - last_display >= runtime.display_refresh_seconds:
                 errors = [
@@ -1716,11 +2089,7 @@ async def run() -> None:
                         started_mono, errors,
                     )
                 )
-                print(
-                    "\x1b[2J\x1b[H" + screen,
-                    end="",
-                    flush=True,
-                )
+                screen_writer.publish(screen)
                 last_display = now_mono
 
             next_sample += sample_interval
@@ -1733,13 +2102,24 @@ async def run() -> None:
                 pass
     finally:
         stop.set()
-        store.save_states(engine.eligible_rows(filter_manager.current.positive_basis_only))
-        futures_futures_store.save_states(
-            futures_futures_engine.eligible_rows(False)
+        disk_writer.submit(
+            store.save_state_rows,
+            store.snapshot_states(
+                engine.eligible_rows(filter_manager.current.positive_basis_only)
+            ),
+        )
+        disk_writer.submit(
+            futures_futures_store.save_state_rows,
+            futures_futures_store.snapshot_states(
+                futures_futures_engine.eligible_rows(False)
+            ),
         )
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        quantile_worker.close()
+        disk_writer.close()
+        screen_writer.close()
 
 # python 程序入口标准写法
 if __name__ == "__main__":

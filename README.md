@@ -10,7 +10,7 @@
 
 每个统计周期只读取各市场当前最新的 bookTicker。所有腿的本机接收年龄和接收时间差都达标时，基差才进入均值、总体标准差和分位数统计；否则跳过本次采样。被拒绝的基差会与2秒内出现的下一条合格基差进行复核，变化至少3bp时限频写入 `data/diagnostics/basis_recheck.jsonl`。
 
-跨现货和永续流的对齐使用本机 `time.monotonic()` 接收时间，因为现货 bookTicker 没有可与永续统一比较的交易所事件时间。接收时间在 WebSocket 消息返回后、JSON解析前立即记录；永续返回的交易所事件时间同时保留在诊断记录中，但不作为跨市场对齐时钟。
+跨现货和永续流的对齐使用本机 `time.monotonic()` 接收时间；同时必须通过连接传输延迟检查。永续bookTicker直接使用每条消息的交易所事件时间 `E`；现货bookTicker没有 `E`，因此每条现货组合连接额外订阅一个同连接 `BTCUSDT@ticker` 作为带 `E` 的传输心跳（只检查连接积压，不参与定价）。本机接收时间看似新、但交易所事件时间落后超过 `max_transport_lag_ms` 时，程序立即关闭该子连接以清空TCP/WebSocket积压，并独立指数退避重连；超时消息不会进入最新报价槽或统计窗口。
 
 ```text
 spot_mid = (spot_bid + spot_ask) / 2
@@ -27,9 +27,9 @@ basis_bps = (normalized_futures_mid / BTCUSDT spot_mid - 1) × 10000
 
 反方向 `BTCUSDC` 现货与 `BTCUSDT` 永续使用除法折算。转换盘口也受行情新鲜度检查；转换价格过期时不产生样本。
 
-bookTicker 持续更新内存报价；统计循环每200ms读取一次双方最新mid，因此每个交易路线每秒最多形成5个固定频率样本。BBO推送频率不会改变滑动统计的样本权重。
+bookTicker 持续覆盖每个交易对容量为1的最新报价槽；统计循环按 `sample_interval_ms`（当前1000ms）读取一次双方最新mid。BBO推送频率不会改变滑动统计的样本权重，也不存在等待消费的BBO业务队列。
 
-每条路线只维护一个总样本滑动队列。μ、σ和运行范围使用总队列；长窗、短窗分别截取总队列尾部指定数量的样本计算P5～P95。窗口未装满时直接使用已有样本，不设置覆盖率或预热门槛。
+每条路线只维护一个总样本滑动队列。μ、σ使用滚动和，运行范围使用单调队列，更新均为均摊O(1)。长窗、短窗分别截取总队列尾部指定数量的样本；P5～P95由单独线程每隔 `quantile_refresh_seconds` 计算并缓存，终端只读取缓存。窗口未装满时直接使用已有样本，不设置覆盖率或预热门槛。
 
 ```text
 μ = rolling_sum / current_sample_count
@@ -94,12 +94,16 @@ spread_bps = (USDC永续折算价 / USDT永续mid - 1) × 10000
   "stale_seconds": 10.0,
   "quote_max_age_ms": 1000,
   "quote_match_tolerance_ms": 200,
+  "max_transport_lag_ms": 2000,
   "persist_interval_seconds": 60.0,
+  "quantile_refresh_seconds": 15.0,
+  "background_write_queue_size": 10000,
+  "book_symbols_per_connection": 80,
   "data_directory": "data"
 }
 ```
 
-配置可以在运行期间保存并热加载；数据目录和BBO队列容量在启动时确定，修改后需重启。队列满时程序丢弃最旧快照并保留最新行情，终端显示当前队列长度和累计丢弃数。`positive_basis_only` 为 `true` 时只显示并保存基差均值为正的交易对；设为 `false` 时不限制基差均值正负。
+配置可以在运行期间保存并热加载；数据目录和后台写盘队列容量在启动时确定，修改后需重启。BBO始终覆盖最新槽位；诊断和高频BBO写盘在队列满时允许丢弃，机会记录与状态会短暂等待最多50ms。每条bookTicker连接最多订阅 `book_symbols_per_connection` 个交易对，超过后自动拆成多条连接；每条子连接独立进行1～30秒指数退避重连，不会因单条连接断开而重启其余连接。`quote_assets` 或跨币种配置热加载后，不再允许的ticker与bookTicker缓存会立即清除，新增币种等待下一条24小时ticker更新后自动建立路线。终端输出使用容量为1的画面槽，控制台变慢时只丢旧画面。`positive_basis_only` 为 `true` 时只显示并保存基差均值为正的交易对；设为 `false` 时不限制基差均值正负。
 
 ## 按交易对持久化
 

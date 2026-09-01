@@ -1,10 +1,13 @@
+import asyncio
 import json
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from main import (
+    BackgroundWriter,
     BasisDiagnosticStore,
     BINANCE_WEBSOCKET_OPTIONS,
     ConfigManager,
@@ -13,11 +16,13 @@ from main import (
     MarketState,
     PairSnapshot,
     PairStatistics,
+    QuantileWorker,
     StatisticsEngine,
     StatisticsConfig,
     format_quote_volume,
     table_row,
     terminal_width,
+    consume_book_chunk,
 )
 
 
@@ -80,6 +85,27 @@ class PairStatisticsTests(unittest.TestCase):
         self.assertEqual(stats.runtime_range, (5.0, 9.0))
         low, high = stats.quantile_range(3, 0.0, 1.0) or (None, None)
         self.assertEqual((low, high), (7.0, 9.0))
+
+    def test_background_quantiles_are_cached_without_render_time_sorting(self):
+        stats = PairStatistics("AAAUSDT")
+        config = StatisticsConfig(
+            total_window_samples=5, long_window_samples=4,
+            short_window_samples=3, quantile_low=0.0, quantile_high=1.0,
+        )
+        for basis in range(5):
+            stats.update(PairSnapshot("AAAUSDT", 100, 100, float(basis)), 1000 + basis, 1, config)
+        worker = QuantileWorker()
+        self.assertTrue(worker.schedule([(stats, config)]))
+        worker.close()
+        self.assertEqual(stats.cached_quantile_range(3, 0.0, 1.0), (2.0, 4.0))
+        self.assertEqual(stats.cached_quantile_range(4, 0.0, 1.0), (1.0, 4.0))
+
+    def test_background_writer_flushes_before_close(self):
+        output = []
+        writer = BackgroundWriter(100)
+        self.assertTrue(writer.submit(output.append, "saved"))
+        writer.close()
+        self.assertEqual(output, ["saved"])
 
     def test_bbo_record_rate_limit_is_per_pair(self):
         stats = PairStatistics("AAAUSDT")
@@ -246,6 +272,22 @@ class MarketStateTests(unittest.TestCase):
         ])
         self.assertEqual(state.common_symbols(), {"BTCUSDT"})
 
+    def test_quote_asset_hot_reload_removes_disallowed_cached_market_data(self):
+        state = MarketState()
+        state.set_pairing_config(FilterConfig(quote_assets=("USDT",)))
+        state.update_tickers("spot", [{"s": "BTCUSDT", "q": "20000000"}])
+        state.update_tickers("futures", [{"s": "BTCUSDT", "q": "30000000"}])
+        state.update_book("spot", {"s": "BTCUSDT", "b": "100", "a": "101"})
+        state.update_book("futures", {"s": "BTCUSDT", "b": "100", "a": "101"})
+
+        state.set_pairing_config(FilterConfig(quote_assets=("USDC",)))
+
+        self.assertNotIn("BTCUSDT", state.spot_volumes)
+        self.assertNotIn("BTCUSDT", state.futures_volumes)
+        self.assertNotIn("BTCUSDT", state.spot_books)
+        self.assertNotIn("BTCUSDT", state.futures_books)
+        self.assertEqual(state.common_symbols(FilterConfig(quote_assets=("USDC",))), set())
+
     def test_mid_basis_and_volume_filter(self):
         state = MarketState()
         state.update_tickers("spot", [{"s": "AAAUSDT", "q": "20000000"}])
@@ -312,6 +354,26 @@ class MarketStateTests(unittest.TestCase):
         self.assertEqual(stats.sample_count, 11)
         self.assertEqual(stats.current_basis_bps, 20.0)
 
+    def test_transport_backlog_is_rejected_even_when_local_receive_time_is_fresh(self):
+        state = MarketState()
+        state.update_tickers("spot", [{"s": "AAAUSDT", "q": "20000000"}])
+        state.update_tickers("futures", [{"s": "AAAUSDT", "q": "20000000"}])
+        state.update_book(
+            "spot", {"s": "AAAUSDT", "b": "100", "a": "100"},
+            transport_lag_ms=100,
+        )
+        state.update_book(
+            "futures", {"s": "AAAUSDT", "b": "101", "a": "101", "E": 1},
+            transport_lag_ms=5000,
+        )
+        state.ticker_connected = {"spot": True, "futures": True}
+        state.book_connected = {"spot": True, "futures": True}
+
+        self.assertEqual(state.snapshots(FilterConfig(), 1, 0.2), [])
+        rejection = state.drain_quote_rejections()[0]
+        self.assertEqual(rejection["reason"], "transport_lag")
+        self.assertEqual(rejection["transport_lags_ms"], [100, 5000])
+
 
 class ConfigManagerTests(unittest.TestCase):
     def test_binance_uses_server_heartbeat_without_client_ping_timeout(self):
@@ -327,6 +389,93 @@ class ConfigManagerTests(unittest.TestCase):
             path.write_text("{保存到一半", encoding="utf-8")
             self.assertFalse(manager.reload())
             self.assertEqual(manager.current.top, 7)
+
+
+class BookConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_book_chunk_reconnects_after_connection_failure(self):
+        state = MarketState()
+        stop = asyncio.Event()
+        attempts = 0
+
+        class FakeSocket:
+            def __init__(self):
+                self.messages = 0
+
+            async def recv(self):
+                self.messages += 1
+                if self.messages == 1:
+                    return json.dumps({
+                        "stream": "btcusdt@ticker",
+                        "data": {"s": "BTCUSDT", "E": int(time.time() * 1000)},
+                    })
+                stop.set()
+                return json.dumps({
+                    "stream": "btcusdt@bookTicker",
+                    "data": {"s": "BTCUSDT", "b": "100", "a": "101"},
+                })
+
+        class FakeConnection:
+            async def __aenter__(self):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise OSError("temporary disconnect")
+                return FakeSocket()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        with mock.patch("main.websockets.connect", side_effect=lambda *_a, **_k: FakeConnection()):
+            await consume_book_chunk("wss://example", "spot", "1", state, stop)
+
+        self.assertEqual(attempts, 2)
+        self.assertIn("BTCUSDT", state.spot_books)
+
+    async def test_transport_lag_closes_backlogged_socket_and_reconnects(self):
+        state = MarketState()
+        state.max_transport_lag_ms = 2000
+        stop = asyncio.Event()
+        attempts = 0
+
+        class FakeSocket:
+            def __init__(self, stale: bool):
+                self.stale = stale
+                self.messages = 0
+
+            async def recv(self):
+                self.messages += 1
+                event_time = int(time.time() * 1000) - (60_000 if self.stale else 0)
+                if self.messages == 1:
+                    return json.dumps({
+                        "stream": "btcusdt@ticker",
+                        "data": {"s": "BTCUSDT", "E": event_time},
+                    })
+                stop.set()
+                return json.dumps({
+                    "stream": "btcusdt@bookTicker",
+                    "data": {"s": "BTCUSDT", "b": "100", "a": "101"},
+                })
+
+        class FakeConnection:
+            def __init__(self, stale: bool):
+                self.socket = FakeSocket(stale)
+
+            async def __aenter__(self):
+                return self.socket
+
+            async def __aexit__(self, *_args):
+                return False
+
+        def connect(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            return FakeConnection(stale=attempts == 1)
+
+        with mock.patch("main.websockets.connect", side_effect=connect):
+            await consume_book_chunk("wss://example", "spot", "1", state, stop)
+
+        self.assertEqual(attempts, 2)
+        self.assertIn("BTCUSDT", state.spot_books)
 
 
 class TerminalTableTests(unittest.TestCase):
