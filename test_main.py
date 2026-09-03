@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -23,6 +24,10 @@ from main import (
     table_row,
     terminal_width,
     consume_book_chunk,
+    RawMessage,
+    RawMessageBuffer,
+    decode_raw_books,
+    receive_raw_books,
 )
 
 
@@ -95,8 +100,11 @@ class PairStatisticsTests(unittest.TestCase):
         for basis in range(5):
             stats.update(PairSnapshot("AAAUSDT", 100, 100, float(basis)), 1000 + basis, 1, config)
         worker = QuantileWorker()
-        self.assertTrue(worker.schedule([(stats, config)]))
-        worker.close()
+        async def calculate():
+            self.assertTrue(worker.schedule([(stats, config)]))
+            self.assertFalse(worker.schedule([(stats, config)]))
+            await worker.close()
+        asyncio.run(calculate())
         self.assertEqual(stats.cached_quantile_range(3, 0.0, 1.0), (2.0, 4.0))
         self.assertEqual(stats.cached_quantile_range(4, 0.0, 1.0), (1.0, 4.0))
 
@@ -106,6 +114,27 @@ class PairStatisticsTests(unittest.TestCase):
         self.assertTrue(writer.submit(output.append, "saved"))
         writer.close()
         self.assertEqual(output, ["saved"])
+
+    def test_full_disk_queue_never_waits_for_space(self):
+        started = threading.Event()
+        release = threading.Event()
+        writer = BackgroundWriter(1)
+
+        def slow_write():
+            started.set()
+            release.wait(5)
+
+        try:
+            writer.submit(slow_write)
+            self.assertTrue(started.wait(2))
+            writer.submit(lambda: None)
+            with mock.patch.object(writer._queue, "put", wraps=writer._queue.put) as put:
+                self.assertFalse(writer.submit(lambda: None))
+                self.assertEqual(put.call_args.kwargs, {"block": False})
+            self.assertEqual(writer.dropped_records, 1)
+        finally:
+            release.set()
+            writer.close()
 
     def test_bbo_record_rate_limit_is_per_pair(self):
         stats = PairStatistics("AAAUSDT")
@@ -408,7 +437,11 @@ class BookConnectionTests(unittest.IsolatedAsyncioTestCase):
                         "stream": "btcusdt@ticker",
                         "data": {"s": "BTCUSDT", "E": int(time.time() * 1000)},
                     })
-                stop.set()
+                if self.messages > 2:
+                    while "BTCUSDT" not in state.spot_books:
+                        await asyncio.sleep(0)
+                    stop.set()
+                    await asyncio.Future()
                 return json.dumps({
                     "stream": "btcusdt@bookTicker",
                     "data": {"s": "BTCUSDT", "b": "100", "a": "101"},
@@ -447,14 +480,13 @@ class BookConnectionTests(unittest.IsolatedAsyncioTestCase):
                 event_time = int(time.time() * 1000) - (60_000 if self.stale else 0)
                 if self.messages == 1:
                     return json.dumps({
-                        "stream": "btcusdt@ticker",
-                        "data": {"s": "BTCUSDT", "E": event_time},
+                        "stream": "btcusdt@bookTicker",
+                        "data": {"s": "BTCUSDT", "E": event_time, "b": "100", "a": "101"},
                     })
+                while "BTCUSDT" not in state.futures_books:
+                    await asyncio.sleep(0)
                 stop.set()
-                return json.dumps({
-                    "stream": "btcusdt@bookTicker",
-                    "data": {"s": "BTCUSDT", "b": "100", "a": "101"},
-                })
+                await asyncio.Future()
 
         class FakeConnection:
             def __init__(self, stale: bool):
@@ -472,10 +504,88 @@ class BookConnectionTests(unittest.IsolatedAsyncioTestCase):
             return FakeConnection(stale=attempts == 1)
 
         with mock.patch("main.websockets.connect", side_effect=connect):
-            await consume_book_chunk("wss://example", "spot", "1", state, stop)
+            await asyncio.wait_for(consume_book_chunk("wss://example", "futures", "1", state, stop), 5)
 
         self.assertEqual(attempts, 2)
-        self.assertIn("BTCUSDT", state.spot_books)
+        self.assertIn("BTCUSDT", state.futures_books)
+
+
+class RawPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_receiver_drops_old_raw_frames_without_json_parsing(self):
+        buffer = RawMessageBuffer(8)
+        stop = asyncio.Event()
+        delivered = asyncio.Event()
+
+        class Socket:
+            count = 0
+
+            async def recv(self):
+                if self.count == 1000:
+                    delivered.set()
+                    await asyncio.Future()
+                self.count += 1
+                return f"not-json-{self.count}"
+
+        with mock.patch("main.json.loads", side_effect=AssertionError("receiver parsed JSON")):
+            task = asyncio.create_task(receive_raw_books(Socket(), buffer, stop))
+            try:
+                await asyncio.wait_for(delivered.wait(), 5)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(len(buffer.messages), 8)
+        self.assertEqual(buffer.dropped, 992)
+        self.assertEqual(buffer.messages[0].payload, "not-json-993")
+        self.assertEqual(buffer.messages[-1].payload, "not-json-1000")
+
+    async def test_decoder_skips_expired_json_and_preserves_receive_time(self):
+        buffer = RawMessageBuffer(8)
+        state = MarketState()
+        stop = asyncio.Event()
+        now = time.monotonic()
+        buffer.append(RawMessage(now - 10, time.time() * 1000, "invalid old JSON"))
+        buffer.append(RawMessage(now - 0.1, time.time() * 1000, json.dumps({
+            "data": {"s": "SUIUSDT", "b": "1", "a": "2"},
+        })))
+        task = asyncio.create_task(decode_raw_books("spot", state, buffer, stop))
+        try:
+            async def wait_decoded():
+                while buffer.decoded < 1:
+                    if task.done():
+                        task.result()
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(wait_decoded(), 2)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(buffer.expired, 1)
+        self.assertEqual(state.spot_books["SUIUSDT"].received_at, now - 0.1)
+        self.assertIsNone(state.spot_books["SUIUSDT"].transport_lag_ms)
+
+    async def test_decoder_yields_between_batches_and_demultiplexes(self):
+        buffer = RawMessageBuffer(1000)
+        state = MarketState()
+        stop = asyncio.Event()
+        now = time.monotonic()
+        for index in range(300):
+            buffer.append(RawMessage(now, time.time() * 1000, json.dumps({
+                "data": {"s": f"COIN{index % 3}USDT", "b": str(index + 1), "a": str(index + 1)},
+            })))
+        task = asyncio.create_task(decode_raw_books("spot", state, buffer, stop))
+        turns = 0
+        try:
+            async def wait_decoded():
+                nonlocal turns
+                while buffer.messages:
+                    turns += 1
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(wait_decoded(), 2)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.assertGreater(turns, 1)
+        self.assertEqual(len(state.spot_books), 3)
+        self.assertEqual(state.spot_books["COIN2USDT"].mid, 300)
 
 
 class TerminalTableTests(unittest.TestCase):

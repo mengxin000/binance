@@ -1,1 +1,2 @@
-websockets>=12,<16
+websockets>=15,<16
+numpy>=1.24,<3

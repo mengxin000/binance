@@ -5,7 +5,7 @@
   "quantile_low": 0.05,
   "quantile_high": 0.95,
   "sigma_multiplier": 2.0,
-  "min_k_sigma_bps": 1.0,
+  "min_k_sigma_bps": 2.0,
   "open_threshold_bps": 7.0,
   "close_threshold_bps": -5.0,
   "bbo_record_interval_ms": 1000

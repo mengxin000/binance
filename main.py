@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import queue
@@ -9,13 +10,15 @@ import threading
 import time
 import unicodedata
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 import websockets
+import numpy as np
 
 BASE_DIR = Path(__file__).resolve().parent
 # 24hr ticker
@@ -129,11 +132,17 @@ class RuntimeConfig:
     quantile_refresh_seconds: float = 15.0
     background_write_queue_size: int = 10_000
     book_symbols_per_connection: int = 80
+    raw_message_capacity: int = 512
+    decode_batch_size: int = 32
     data_directory: str = "data"
 
     def validate(self) -> None:
         if not isinstance(self.sample_interval_ms, int) or self.sample_interval_ms < 50:
             raise ValueError("sample_interval_ms 必须是至少 50 的整数")
+        for name in ("raw_message_capacity", "decode_batch_size"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65536:
+                raise ValueError(f"{name} 必须是 1 到 65536 的整数")
         if self.display_refresh_seconds <= 0 or self.stale_seconds <= 0:
             raise ValueError("显示刷新和行情过期时间必须大于 0")
         if not isinstance(self.quote_max_age_ms, int) or self.quote_max_age_ms < 1:
@@ -314,6 +323,9 @@ class MarketState:
         self.futures_books: dict[str, BookQuote] = {}
         self.quote_rejections: list[dict[str, Any]] = []
         self.max_transport_lag_ms: float = 2000.0
+        self.raw_buffers: dict[str, RawMessageBuffer] = {}
+        self.loop_lag_ms = 0.0
+        self.max_loop_lag_ms = 0.0
         self.active_routes: dict[str, PairRoute] = {}
         # 移除 BBO 队列，改为在主循环定时采样时统一处理
         self.routes_version: int = 0
@@ -892,16 +904,8 @@ class PairStatistics:
         if not self.basis_samples:
             return None
         count = min(sample_size, self.sample_count)
-        values = sorted(list(self.basis_samples)[-count:])
-
-        def percentile(q: float) -> float:
-            position = q * (len(values) - 1)
-            left = int(position)
-            right = min(left + 1, len(values) - 1)
-            weight = position - left
-            return values[left] * (1 - weight) + values[right] * weight
-
-        return percentile(low), percentile(high)
+        values = np.fromiter(islice(reversed(self.basis_samples), count), dtype=np.float64, count=count)
+        return _percentile_range(values, low, high)
 
     def cached_quantile_range(
         self, sample_size: int, low: float, high: float
@@ -1201,16 +1205,9 @@ class BackgroundWriter:
             self._queue.put_nowait(item)
             return True
         except queue.Full:
-            if droppable:
-                self.dropped_records += 1
-                return False
-            # Opportunity/state records are rare and important. Reserve a brief bounded wait.
-            try:
-                self._queue.put(item, timeout=0.05)
-                return True
-            except queue.Full:
-                self.dropped_records += 1
-                return False
+            # Never block the event loop, even for opportunity records.
+            self.dropped_records += 1
+            return False
 
     def _run(self) -> None:
         while True:
@@ -1226,8 +1223,12 @@ class BackgroundWriter:
                 self._queue.task_done()
 
     def close(self) -> None:
-        self._queue.join()
-        self._queue.put(None)
+        # Shutdown is bounded even when a filesystem call stalls.
+        try:
+            self._queue.put(None, timeout=1)
+        except queue.Full:
+            self.last_error = "写盘队列未排空，退出时放弃等待"
+            return
         self._thread.join(timeout=5)
 
 
@@ -1236,12 +1237,13 @@ class LatestScreenWriter:
 
     def __init__(self) -> None:
         self._condition = threading.Condition()
-        self._latest: str | None = None
+        self._latest: Any = None
         self._closed = False
+        self.last_error = ""
         self._thread = threading.Thread(target=self._run, name="terminal-writer", daemon=True)
         self._thread.start()
 
-    def publish(self, screen: str) -> None:
+    def publish(self, screen: Any) -> None:
         with self._condition:
             self._latest = screen
             self._condition.notify()
@@ -1253,7 +1255,12 @@ class LatestScreenWriter:
                 if self._closed and self._latest is None:
                     return
                 screen, self._latest = self._latest, None
-            print("\x1b[2J\x1b[H" + (screen or ""), end="", flush=True)
+            try:
+                if callable(screen):
+                    screen = screen()
+                print("\x1b[2J\x1b[H" + (screen or ""), end="", flush=True)
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
 
     def close(self) -> None:
         with self._condition:
@@ -1262,17 +1269,9 @@ class LatestScreenWriter:
         self._thread.join(timeout=5)
 
 
-def _percentile_range(values: list[float], low: float, high: float) -> tuple[float, float]:
-    values.sort()
-
-    def percentile(q: float) -> float:
-        position = q * (len(values) - 1)
-        left = int(position)
-        right = min(left + 1, len(values) - 1)
-        weight = position - left
-        return values[left] * (1 - weight) + values[right] * weight
-
-    return percentile(low), percentile(high)
+def _percentile_range(values: Any, low: float, high: float) -> tuple[float, float]:
+    result = np.quantile(values, [low, high], method="linear")
+    return float(result[0]), float(result[1])
 
 
 class QuantileWorker:
@@ -1280,43 +1279,53 @@ class QuantileWorker:
 
     def __init__(self) -> None:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="quantiles")
-        self._future: Future[list[tuple[PairStatistics, tuple[int, float, float], tuple[float, float]]]] | None = None
+        self._task: asyncio.Task[None] | None = None
 
     def collect(self) -> None:
-        if self._future is None or not self._future.done():
+        if self._task is None or not self._task.done():
             return
         try:
-            for stats, key, result in self._future.result():
-                stats.quantile_cache[key] = result
+            self._task.result()
         finally:
-            self._future = None
+            self._task = None
 
     def schedule(self, jobs: list[tuple[PairStatistics, StatisticsConfig]]) -> bool:
         self.collect()
-        if self._future is not None:
+        if self._task is not None:
             return False
-        snapshots: list[tuple[PairStatistics, list[float], tuple[int, float, float]]] = []
-        for stats, config in jobs:
-            values = list(stats.basis_samples)
-            for sample_size in (config.short_window_samples, config.long_window_samples):
-                count = min(sample_size, len(values))
-                if count:
-                    key = (sample_size, config.quantile_low, config.quantile_high)
-                    snapshots.append((stats, values[-count:], key))
-
-        def calculate() -> list[tuple[PairStatistics, tuple[int, float, float], tuple[float, float]]]:
-            return [
-                (stats, key, _percentile_range(values, key[1], key[2]))
-                for stats, values, key in snapshots
-            ]
-
-        self._future = self._executor.submit(calculate)
+        self._task = asyncio.create_task(self._calculate(jobs))
         return True
 
-    def close(self) -> None:
-        self.collect()
-        self._executor.shutdown(wait=True, cancel_futures=True)
-        self.collect()
+    async def _calculate(self, jobs: list[tuple[PairStatistics, StatisticsConfig]]) -> None:
+        loop = asyncio.get_running_loop()
+        for stats, config in jobs:
+            # Only copy the needed tail, one pair at a time. Never pass a live deque
+            # to a worker thread or hold an iterator over it across an await.
+            count = min(config.long_window_samples, len(stats.basis_samples))
+            if not count:
+                continue
+            values = np.fromiter(
+                islice(reversed(stats.basis_samples), count), dtype=np.float64, count=count
+            )
+            await asyncio.sleep(0)
+            cache = {}
+            for sample_size in (config.short_window_samples, config.long_window_samples):
+                count = min(sample_size, len(values))
+                key = (sample_size, config.quantile_low, config.quantile_high)
+                cache[key] = await loop.run_in_executor(
+                    self._executor, _percentile_range,
+                    values[:count], config.quantile_low, config.quantile_high,
+                )
+            stats.quantile_cache = cache
+
+    async def close(self, cancel: bool = False) -> None:
+        if self._task is not None:
+            if cancel:
+                self._task.cancel()
+                await asyncio.gather(self._task, return_exceptions=True)
+            else:
+                await self._task
+        await asyncio.to_thread(self._executor.shutdown, wait=True, cancel_futures=True)
 
 
 # 分析
@@ -1400,71 +1409,117 @@ async def consume_tickers(url: str, market: str, state: MarketState, stop: async
     state.ticker_connected[market] = False
 
 
+@dataclass(frozen=True, slots=True)
+class RawMessage:
+    received_at: float
+    received_wall_ms: float
+    payload: str | bytes
+
+
+class RawMessageBuffer:
+    """Event-loop-owned bounded FIFO. Overflow discards the oldest raw message."""
+
+    def __init__(self, capacity: int) -> None:
+        self.messages: deque[RawMessage] = deque(maxlen=capacity)
+        self.ready = asyncio.Event()
+        self.received = self.dropped = self.expired = self.decoded = 0
+
+    def append(self, message: RawMessage) -> None:
+        self.received += 1
+        if len(self.messages) == self.messages.maxlen:
+            self.dropped += 1
+        self.messages.append(message)
+        self.ready.set()
+
+
+async def receive_raw_books(websocket: Any, buffer: RawMessageBuffer, stop: asyncio.Event) -> None:
+    count = 0
+    while not stop.is_set():
+        async with asyncio.timeout(45):
+            payload = await websocket.recv()
+        buffer.append(RawMessage(time.monotonic(), time.time() * 1000, payload))
+        count += 1
+        # recv may complete immediately while the library has buffered frames.
+        if count % 64 == 0:
+            await asyncio.sleep(0)
+
+
+async def decode_raw_books(
+    market: str, state: MarketState, buffer: RawMessageBuffer,
+    stop: asyncio.Event, runtime_manager: ConfigManager[RuntimeConfig] | None = None,
+) -> None:
+    while not stop.is_set():
+        await buffer.ready.wait()
+        runtime = runtime_manager.current if runtime_manager is not None else RuntimeConfig()
+        batch_started = time.monotonic()
+        for _ in range(runtime.decode_batch_size):
+            if not buffer.messages:
+                buffer.ready.clear()
+                break
+            message = buffer.messages.popleft()
+            # Discard expired raw messages before spending CPU on JSON parsing.
+            if (time.monotonic() - message.received_at) * 1000 > runtime.quote_max_age_ms:
+                buffer.expired += 1
+            else:
+                payload = json.loads(message.payload)
+                row = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(row, dict) and "b" in row and "a" in row:
+                    lag = None
+                    if market == "futures":
+                        event_time = row.get("E")
+                        if isinstance(event_time, (int, float)) and not isinstance(event_time, bool):
+                            lag = max(0.0, message.received_wall_ms - event_time)
+                            if lag > state.max_transport_lag_ms:
+                                raise TransportLagError(
+                                    f"永续事件延迟 {lag:.0f}ms，上限 {state.max_transport_lag_ms:.0f}ms"
+                                )
+                    state.update_book(market, row, message.received_at, lag)
+                    buffer.decoded += 1
+            # Bound parsing work per turn as well as per batch.
+            if time.monotonic() - batch_started >= 0.002:
+                break
+        await asyncio.sleep(0)
+
+
 async def consume_book_chunk(
     url: str,
     market: str,
     connection_key: str,
     state: MarketState,
     stop: asyncio.Event,
+    runtime_manager: ConfigManager[RuntimeConfig] | None = None,
 ) -> None:
     delay = 1.0
     error_key = f"{market}_book_{connection_key}"
     while not stop.is_set():
         try:
-            last_heartbeat_event_ms: int | None = None
             async with websockets.connect(url, **BINANCE_WEBSOCKET_OPTIONS) as websocket:
+                runtime = runtime_manager.current if runtime_manager is not None else RuntimeConfig()
+                buffer = RawMessageBuffer(runtime.raw_message_capacity)
+                state.raw_buffers[error_key] = buffer
                 state.set_book_chunk_connected(market, connection_key, True)
                 state.errors[error_key] = ""
-                delay = 1.0
-                while not stop.is_set():
-                    message = await asyncio.wait_for(websocket.recv(), timeout=45)
-                    # Capture arrival before JSON parsing; latest symbol slot is overwritten.
-                    received_at = time.monotonic()
-                    received_wall_ms = time.time() * 1000
-                    payload = json.loads(message)
-                    row = payload.get("data") if isinstance(payload, dict) else None
-                    stream = str(payload.get("stream", "")) if isinstance(payload, dict) else ""
-                    if isinstance(row, dict):
-                        event_time = row.get("E")
-                        if (
-                            market == "spot"
-                            and stream.lower().endswith("@ticker")
-                            and isinstance(event_time, (int, float))
-                        ):
-                            last_heartbeat_event_ms = int(event_time)
-                            heartbeat_lag_ms = max(
-                                0.0, received_wall_ms - last_heartbeat_event_ms
-                            )
-                            if heartbeat_lag_ms > state.max_transport_lag_ms:
-                                raise TransportLagError(
-                                    f"现货连接积压 {heartbeat_lag_ms:.0f}ms，"
-                                    f"上限 {state.max_transport_lag_ms:.0f}ms"
-                                )
-                            continue
-                        transport_event_ms = (
-                            int(event_time)
-                            if isinstance(event_time, (int, float))
-                            and not isinstance(event_time, bool)
-                            else last_heartbeat_event_ms
-                        )
-                        # Spot bookTicker has no E. Until the same socket has delivered
-                        # its timestamped ticker heartbeat, its BBO cannot be proven fresh.
-                        if transport_event_ms is None:
-                            continue
-                        transport_lag_ms = max(
-                            0.0, received_wall_ms - transport_event_ms
-                        )
-                        if transport_lag_ms > state.max_transport_lag_ms:
-                            raise TransportLagError(
-                                f"{market}连接积压 {transport_lag_ms:.0f}ms，"
-                                f"上限 {state.max_transport_lag_ms:.0f}ms"
-                            )
-                        state.update_book(
-                            market, row, received_at, transport_lag_ms
-                        )
+                connected_at = time.monotonic()
+                workers = [
+                    asyncio.create_task(receive_raw_books(websocket, buffer, stop)),
+                    asyncio.create_task(decode_raw_books(market, state, buffer, stop, runtime_manager)),
+                    asyncio.create_task(stop.wait()),
+                ]
+                try:
+                    done, _ = await asyncio.wait(workers, return_when=asyncio.FIRST_COMPLETED)
+                    for worker in done:
+                        worker.result()
+                finally:
+                    for worker in workers:
+                        worker.cancel()
+                    await asyncio.gather(*workers, return_exceptions=True)
+                    state.set_book_chunk_connected(market, connection_key, False)
+                    if time.monotonic() - connected_at >= 30:
+                        delay = 1.0
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            state.set_book_chunk_connected(market, connection_key, False)
             state.errors[error_key] = f"{type(exc).__name__}: {exc}"
             try:
                 await asyncio.wait_for(stop.wait(), timeout=delay)
@@ -1493,18 +1548,19 @@ async def consume_books(
             continue
         routes_version = state.routes_version
         chunk_size = runtime_manager.current.book_symbols_per_connection
+        capacity = runtime_manager.current.raw_message_capacity
         chunks = [symbols[index:index + chunk_size] for index in range(0, len(symbols), chunk_size)]
         state.errors[f"{market}_book"] = ""
         for key in list(state.errors):
             if key.startswith(f"{market}_book_"):
                 state.errors.pop(key, None)
+                state.raw_buffers.pop(key, None)
         tasks = [
             asyncio.create_task(consume_book_chunk(
                 base_url + "/".join(
                     [f"{symbol.lower()}@bookTicker" for symbol in chunk]
-                    + (["btcusdt@ticker"] if market == "spot" else [])
                 ),
-                market, str(index), state, stop,
+                market, str(index), state, stop, runtime_manager,
             ))
             for index, chunk in enumerate(chunks, 1)
         ]
@@ -1521,6 +1577,7 @@ async def consume_books(
                     state.routes_version != routes_version
                     or state.book_symbols(market, filter_manager.current) != set(symbols)
                     or runtime_manager.current.book_symbols_per_connection != chunk_size
+                    or runtime_manager.current.raw_message_capacity != capacity
                 ):
                     break
         except asyncio.CancelledError:
@@ -1577,6 +1634,25 @@ def table_row(values: list[str], widths: list[int], aligns: list[str]) -> str:
     )
 
 
+def pipeline_status(state: MarketState) -> str:
+    buffers = list(state.raw_buffers.values())
+    return (
+        f"BBO原始缓存(本轮连接): {sum(len(b.messages) for b in buffers)} / "
+        f"{sum(b.messages.maxlen or 0 for b in buffers)} | "
+        f"溢出丢弃: {sum(b.dropped for b in buffers)} | "
+        f"过期丢弃: {sum(b.expired for b in buffers)} | "
+        f"事件循环延迟: {state.loop_lag_ms:.1f}ms / 峰值 {state.max_loop_lag_ms:.1f}ms"
+    )
+
+
+async def monitor_loop_lag(state: MarketState, stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        expected = time.monotonic() + 0.1
+        await asyncio.sleep(0.1)
+        state.loop_lag_ms = max(0.0, (time.monotonic() - expected) * 1000)
+        state.max_loop_lag_ms = max(state.max_loop_lag_ms, state.loop_lag_ms)
+
+
 # 显示
 def render(
     state: MarketState,
@@ -1606,7 +1682,8 @@ def render(
         f"入选统计: {len(rows)} | 正基差筛选: {'开启' if filters.positive_basis_only else '关闭'} | "
         f"采样周期: {runtime.sample_interval_ms}ms | 本次运行: {format_duration(time.monotonic() - started_mono)}",
         f"报价匹配: 最大年龄 {runtime.quote_max_age_ms}ms / 最大时差 {runtime.quote_match_tolerance_ms}ms / "
-        f"最大传输延迟 {runtime.max_transport_lag_ms}ms",
+        f"永续E延迟上限 {runtime.max_transport_lag_ms}ms（现货仅检查接收时间）",
+        pipeline_status(state),
         f"样本窗口: 总{stats_config.total_window_samples} / 长{stats_config.long_window_samples} / "
         f"短{stats_config.short_window_samples} | "
         f"初筛: {stats_config.sigma_multiplier:g}σ > {stats_config.min_k_sigma_bps:g}bp",
@@ -1718,7 +1795,8 @@ def render_futures_futures(
         f"采样周期: {runtime.sample_interval_ms}ms | "
         f"本次运行: {format_duration(time.monotonic() - started_mono)}",
         f"报价匹配: 最大年龄 {runtime.quote_max_age_ms}ms / 最大时差 {runtime.quote_match_tolerance_ms}ms / "
-        f"最大传输延迟 {runtime.max_transport_lag_ms}ms",
+        f"永续E延迟上限 {runtime.max_transport_lag_ms}ms（现货仅检查接收时间）",
+        pipeline_status(state),
         f"样本窗口: 总{stats_config.total_window_samples} / 长{stats_config.long_window_samples} / "
         f"短{stats_config.short_window_samples} | "
         f"初筛: {stats_config.sigma_multiplier:g}σ > {stats_config.min_k_sigma_bps:g}bp",
@@ -1819,6 +1897,39 @@ def resolve_path(path_text: str) -> Path:
     return path if path.is_absolute() else BASE_DIR / path
 
 
+def reload_configs(managers: tuple[Any, ...]) -> None:
+    for manager in managers:
+        manager.reload()
+
+
+async def resize_statistics_windows(engine: StatisticsEngine, size: int) -> None:
+    for stats in engine.pairs.values():
+        while len(stats.basis_samples) > size:
+            stats.resize_window(max(size, len(stats.basis_samples) - 2048))
+            await asyncio.sleep(0)
+
+
+def make_screen_job(
+    renderer: Any, state: MarketState, engine: StatisticsEngine,
+    filters: FilterConfig, config: StatisticsConfig, runtime: RuntimeConfig,
+    started: float, errors: list[str],
+) -> Any:
+    # Rendering must not iterate over dictionaries/deques being mutated by receivers.
+    view = copy.copy(state)
+    for key, value in vars(state).items():
+        if isinstance(value, dict):
+            setattr(view, key, value.copy())
+    rows = {}
+    for symbol, stats in engine.pairs.items():
+        row = copy.copy(stats)
+        row.basis_samples = deque()
+        row.minimum_samples = deque(islice(stats.minimum_samples, 1))
+        row.maximum_samples = deque(islice(stats.maximum_samples, 1))
+        rows[symbol] = row
+    snapshot_engine = StatisticsEngine(rows)
+    return lambda: renderer(view, snapshot_engine, filters, config, runtime, started, errors)
+
+
 async def run() -> None:
     filter_manager = ConfigManager(FILTER_CONFIG_PATH, FilterConfig)
     statistics_manager = ConfigManager(STATISTICS_CONFIG_PATH, StatisticsConfig)
@@ -1848,6 +1959,7 @@ async def run() -> None:
             pass
     # 移除 process_bbo_updates 后台任务，改为在主循环统一采样点处理 BBO，消除队列丢弃偏差
     tasks = [
+        asyncio.create_task(monitor_loop_lag(state, stop)),
         asyncio.create_task(consume_tickers(SPOT_TICKER_STREAM, "spot", state, stop)),
         asyncio.create_task(consume_tickers(FUTURES_TICKER_STREAM, "futures", state, stop)),
         asyncio.create_task(consume_books(
@@ -1868,16 +1980,16 @@ async def run() -> None:
                     if exception is not None:
                         raise RuntimeError("后台任务异常退出") from exception
                     raise RuntimeError("后台任务意外停止")
-            filter_manager.reload()
-            statistics_manager.reload()
-            futures_futures_statistics_manager.reload()
-            runtime_manager.reload()
+            await asyncio.to_thread(reload_configs, (
+                filter_manager, statistics_manager,
+                futures_futures_statistics_manager, runtime_manager,
+            ))
             filters = filter_manager.current
             state.set_pairing_config(filters)
             stats_config = statistics_manager.current
             futures_futures_stats_config = futures_futures_statistics_manager.current
-            engine.resize_windows(stats_config.total_window_samples)
-            futures_futures_engine.resize_windows(
+            await resize_statistics_windows(engine, stats_config.total_window_samples)
+            await resize_statistics_windows(futures_futures_engine,
                 futures_futures_stats_config.total_window_samples
             )
             runtime = runtime_manager.current
@@ -1989,15 +2101,11 @@ async def run() -> None:
                 if not usdt or not usdc or not conversion_book or conversion_book.mid <= 0:
                     continue
                 now_mono_chk = time.monotonic()
-                ages = [
-                    now_mono_chk - usdt.received_at,
-                    now_mono_chk - usdc.received_at,
-                    now_mono_chk - conversion_book.received_at,
-                ]
-                if (
-                    max(ages) > quote_max_age
-                    or max(ages) - min(ages) > quote_tolerance
-                ):
+                valid, _, _, _ = state._quote_quality(
+                    [usdt, usdc, conversion_book], now_mono_chk,
+                    quote_max_age, quote_tolerance,
+                )
+                if not valid:
                     continue
                 conversion_rate = (
                     1 / conversion_book.mid
@@ -2077,19 +2185,17 @@ async def run() -> None:
                     )
                     if manager.error
                 ]
-                screen = (
-                    render(
-                        state, engine, filters, stats_config,
-                        runtime, started_mono, errors,
-                    )
-                    if current_page == "spot_futures"
-                    else render_futures_futures(
-                        state, futures_futures_engine, filters,
-                        futures_futures_stats_config, runtime,
-                        started_mono, errors,
-                    )
-                )
-                screen_writer.publish(screen)
+                state.errors["background"] = " / ".join(filter(None, (
+                    disk_writer.last_error, screen_writer.last_error,
+                    f"写盘任务丢弃 {disk_writer.dropped_records}" if disk_writer.dropped_records else "",
+                )))
+                sf_page = current_page == "spot_futures"
+                screen_writer.publish(make_screen_job(
+                    render if sf_page else render_futures_futures,
+                    state, engine if sf_page else futures_futures_engine,
+                    filters, stats_config if sf_page else futures_futures_stats_config,
+                    runtime, started_mono, errors,
+                ))
                 last_display = now_mono
 
             next_sample += sample_interval
@@ -2117,9 +2223,11 @@ async def run() -> None:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        quantile_worker.close()
-        disk_writer.close()
-        screen_writer.close()
+        await quantile_worker.close(cancel=True)
+        await asyncio.gather(
+            asyncio.to_thread(disk_writer.close),
+            asyncio.to_thread(screen_writer.close),
+        )
 
 # python 程序入口标准写法
 if __name__ == "__main__":

@@ -9,5 +9,7 @@
   "quantile_refresh_seconds": 15.0,
   "background_write_queue_size": 10000,
   "book_symbols_per_connection": 80,
+  "raw_message_capacity": 1024,
+  "decode_batch_size": 128,
   "data_directory": "data"
 }
