@@ -19,6 +19,9 @@ from typing import Any, Generic, TypeVar
 
 import websockets
 import numpy as np
+from functools import partial
+from websockets.asyncio.client import ClientConnection
+from websockets.frames import Frame, OP_TEXT, OP_BINARY, OP_CONT
 
 BASE_DIR = Path(__file__).resolve().parent
 # 24hr ticker
@@ -1432,6 +1435,45 @@ class RawMessageBuffer:
         self.ready.set()
 
 
+class LatestBBOConnection(ClientConnection):
+    """BBO-only adapter: bound complete messages before the library's FIFO.
+
+    Control frames and protocol validation remain owned by websockets. Never
+    drop fragments: reassemble a complete message before applying overflow.
+    This process_event integration is tested against websockets 15.x.
+    """
+
+    def __init__(self, *args: Any, raw_capacity: int = 512, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.raw_buffer = RawMessageBuffer(raw_capacity)
+        self.fragments: list[bytes] = []
+        self.last_message_at = time.monotonic()
+
+    def process_event(self, event: Any) -> None:
+        if self.response is not None and isinstance(event, Frame) and event.opcode in (
+            OP_TEXT, OP_BINARY, OP_CONT,
+        ):
+            self.fragments.append(bytes(event.data))
+            if event.fin:
+                payload = b"".join(self.fragments)
+                self.fragments.clear()
+                self.last_message_at = time.monotonic()
+                self.raw_buffer.append(RawMessage(
+                    self.last_message_at, time.time() * 1000, payload,
+                ))
+            return
+        super().process_event(event)
+
+    async def watch_connection(self) -> None:
+        while not self.connection_lost_waiter.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(self.connection_lost_waiter), 1)
+            except asyncio.TimeoutError:
+                if time.monotonic() - self.last_message_at > 45:
+                    raise TimeoutError("BBO 45秒未收到完整消息")
+        raise self.protocol.close_exc
+
+
 async def receive_raw_books(websocket: Any, buffer: RawMessageBuffer, stop: asyncio.Event) -> None:
     count = 0
     while not stop.is_set():
@@ -1493,15 +1535,20 @@ async def consume_book_chunk(
     error_key = f"{market}_book_{connection_key}"
     while not stop.is_set():
         try:
-            async with websockets.connect(url, **BINANCE_WEBSOCKET_OPTIONS) as websocket:
-                runtime = runtime_manager.current if runtime_manager is not None else RuntimeConfig()
-                buffer = RawMessageBuffer(runtime.raw_message_capacity)
+            runtime = runtime_manager.current if runtime_manager is not None else RuntimeConfig()
+            async with websockets.connect(
+                url, **BINANCE_WEBSOCKET_OPTIONS,
+                create_connection=partial(LatestBBOConnection, raw_capacity=runtime.raw_message_capacity),
+            ) as websocket:
+                direct = isinstance(websocket, LatestBBOConnection)
+                buffer = websocket.raw_buffer if direct else RawMessageBuffer(runtime.raw_message_capacity)
                 state.raw_buffers[error_key] = buffer
                 state.set_book_chunk_connected(market, connection_key, True)
                 state.errors[error_key] = ""
                 connected_at = time.monotonic()
                 workers = [
-                    asyncio.create_task(receive_raw_books(websocket, buffer, stop)),
+                    asyncio.create_task(websocket.watch_connection() if direct else
+                                        receive_raw_books(websocket, buffer, stop)),
                     asyncio.create_task(decode_raw_books(market, state, buffer, stop, runtime_manager)),
                     asyncio.create_task(stop.wait()),
                 ]
@@ -1637,11 +1684,13 @@ def table_row(values: list[str], widths: list[int], aligns: list[str]) -> str:
 def pipeline_status(state: MarketState) -> str:
     buffers = list(state.raw_buffers.values())
     return (
-        f"BBO原始缓存(本轮连接): {sum(len(b.messages) for b in buffers)} / "
+        f"BBO解帧缓存(本轮连接): {sum(len(b.messages) for b in buffers)} / "
         f"{sum(b.messages.maxlen or 0 for b in buffers)} | "
         f"溢出丢弃: {sum(b.dropped for b in buffers)} | "
         f"过期丢弃: {sum(b.expired for b in buffers)} | "
-        f"事件循环延迟: {state.loop_lag_ms:.1f}ms / 峰值 {state.max_loop_lag_ms:.1f}ms"
+        f"主循环延迟: {state.loop_lag_ms:.1f}ms / 峰值 {state.max_loop_lag_ms:.1f}ms | "
+        f"网络循环延迟: {getattr(state, 'network_loop_lag_ms', 0):.1f}ms / "
+        f"峰值 {getattr(state, 'network_max_loop_lag_ms', 0):.1f}ms"
     )
 
 
@@ -1909,6 +1958,92 @@ async def resize_statistics_windows(engine: StatisticsEngine, size: int) -> None
             await asyncio.sleep(0)
 
 
+class MarketNetworkWorker:
+    """Own all sockets on a dedicated loop; publish latest state, never a backlog.
+
+    Config objects are immutable and replaced atomically by ConfigManager.
+    Mutable market dictionaries never cross thread boundaries without copying.
+    """
+
+    def __init__(self, filters: Any, runtime: Any) -> None:
+        self.filters, self.runtime = filters, runtime
+        self._lock = threading.Lock()
+        self._snapshot: dict[str, Any] = {}
+        self._exit = threading.Event()
+        self.error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, name="market-network", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            asyncio.run(self._serve())
+        except BaseException as exc:
+            self.error = exc
+
+    async def _serve(self) -> None:
+        state = MarketState()
+        stop = asyncio.Event()
+        state.set_pairing_config(self.filters.current)
+        tasks = [
+            asyncio.create_task(monitor_loop_lag(state, stop)),
+            asyncio.create_task(consume_tickers(SPOT_TICKER_STREAM, "spot", state, stop)),
+            asyncio.create_task(consume_tickers(FUTURES_TICKER_STREAM, "futures", state, stop)),
+            asyncio.create_task(consume_books("spot", state, self.filters, self.runtime, stop)),
+            asyncio.create_task(consume_books("futures", state, self.filters, self.runtime, stop)),
+        ]
+        try:
+            while not self._exit.is_set():
+                for task in tasks:
+                    if task.done():
+                        task.result()
+                        raise RuntimeError("网络任务意外退出")
+                state.set_pairing_config(self.filters.current)
+                state.max_transport_lag_ms = self.runtime.current.max_transport_lag_ms
+                snapshot = {name: getattr(state, name).copy() for name in (
+                    "spot_volumes", "futures_volumes", "spot_books", "futures_books",
+                    "ticker_connected", "book_connected", "ticker_last_update",
+                    "book_last_update", "errors",
+                )}
+                buffers = {}
+                for key, buffer in state.raw_buffers.items():
+                    view = copy.copy(buffer)
+                    # Only occupancy/counters are exposed to the UI, not raw messages.
+                    view.messages = deque([None] * len(buffer.messages), maxlen=buffer.messages.maxlen)
+                    buffers[key] = view
+                snapshot.update(raw_buffers=buffers, network_loop_lag_ms=state.loop_lag_ms,
+                                network_max_loop_lag_ms=state.max_loop_lag_ms)
+                with self._lock:
+                    self._snapshot = snapshot
+                await asyncio.sleep(0.05)
+        finally:
+            stop.set()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def apply_latest(self, state: MarketState) -> None:
+        if self.error is not None:
+            raise RuntimeError("网络线程退出") from self.error
+        with self._lock:
+            snapshot = self._snapshot
+        for name, value in snapshot.items():
+            if name == "errors":
+                background = state.errors.get("background")
+                state.errors = value.copy()
+                if background:
+                    state.errors["background"] = background
+            else:
+                setattr(state, name, value.copy() if isinstance(value, dict) else value)
+
+    def close(self) -> None:
+        self._exit.set()
+        self._thread.join(timeout=8)
+        if self._thread.is_alive():
+            raise RuntimeError("网络线程未在8秒内退出")
+
+
 def make_screen_job(
     renderer: Any, state: MarketState, engine: StatisticsEngine,
     filters: FilterConfig, config: StatisticsConfig, runtime: RuntimeConfig,
@@ -1957,17 +2092,10 @@ async def run() -> None:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass
-    # 移除 process_bbo_updates 后台任务，改为在主循环统一采样点处理 BBO，消除队列丢弃偏差
+    network_worker = MarketNetworkWorker(filter_manager, runtime_manager)
+    network_worker.start()
     tasks = [
         asyncio.create_task(monitor_loop_lag(state, stop)),
-        asyncio.create_task(consume_tickers(SPOT_TICKER_STREAM, "spot", state, stop)),
-        asyncio.create_task(consume_tickers(FUTURES_TICKER_STREAM, "futures", state, stop)),
-        asyncio.create_task(consume_books(
-            "spot", state, filter_manager, runtime_manager, stop
-        )),
-        asyncio.create_task(consume_books(
-            "futures", state, filter_manager, runtime_manager, stop
-        )),
     ]
     last_display = last_persist = last_quantile = 0.0
     next_sample = time.monotonic()
@@ -1985,6 +2113,7 @@ async def run() -> None:
                 futures_futures_statistics_manager, runtime_manager,
             ))
             filters = filter_manager.current
+            network_worker.apply_latest(state)
             state.set_pairing_config(filters)
             stats_config = statistics_manager.current
             futures_futures_stats_config = futures_futures_statistics_manager.current
@@ -2227,6 +2356,7 @@ async def run() -> None:
         await asyncio.gather(
             asyncio.to_thread(disk_writer.close),
             asyncio.to_thread(screen_writer.close),
+            asyncio.to_thread(network_worker.close),
         )
 
 # python 程序入口标准写法
