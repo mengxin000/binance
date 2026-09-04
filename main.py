@@ -1452,21 +1452,39 @@ class StatisticsEngine:
         )
 
 
-async def consume_tickers(url: str, market: str, state: MarketState, stop: asyncio.Event) -> None:
+async def consume_tickers(
+    url: str, market: str, state: MarketState, stop: asyncio.Event,
+    diagnostics: NetworkDiagnostics | None = None,
+) -> None:
     delay = 1.0
     error_key = f"{market}_ticker"
     while not stop.is_set():
         try:
+            connect_started = time.monotonic()
             async with websockets.connect(
                 url, **(await state.connection_options(url)),
             ) as websocket:
+                if diagnostics is not None:
+                    diagnostics.emit(
+                        "connection_open", connection=error_key,
+                        duration_ms=round((time.monotonic() - connect_started) * 1000, 1),
+                    )
                 state.ticker_connected[market] = True
                 state.errors[error_key] = ""
                 delay = 1.0
                 while not stop.is_set():
-                    payload = json.loads(await asyncio.wait_for(websocket.recv(), timeout=45))
+                    raw = await asyncio.wait_for(websocket.recv(), timeout=45)
+                    parse_started = time.monotonic()
+                    payload = json.loads(raw)
                     if isinstance(payload, list):
                         state.update_tickers(market, payload)
+                    elapsed_ms = (time.monotonic() - parse_started) * 1000
+                    if diagnostics is not None and elapsed_ms >= 100:
+                        diagnostics.emit(
+                            "slow_ticker_parse", connection=error_key,
+                            duration_ms=round(elapsed_ms, 1),
+                            rows=len(payload) if isinstance(payload, list) else 0,
+                        )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1671,6 +1689,7 @@ class LatestQuotePipeline:
                 break
             cycle_started = time.monotonic()
             rows = self._take_dirty()
+            cycle_lags: dict[str, dict[str, Any]] = {}
             for raw in rows:
                 age_ms = (time.monotonic() - raw.message.received_at) * 1000
                 if age_ms > self.runtime_manager.current.quote_max_age_ms:
@@ -1709,11 +1728,17 @@ class LatestQuotePipeline:
                             )
                             with self.lock:
                                 self.faults[raw.connection_token] = detail
-                            self.diagnostics.emit(
-                                "transport_lag", connection=raw.connection_key,
-                                symbol=symbol, lag_ms=round(lag, 1),
-                                raw_age_ms=round(age_ms, 1),
+                            lag_row = cycle_lags.setdefault(raw.connection_key, {
+                                "affected_symbols": 0, "max_lag_ms": 0.0,
+                                "max_lag_symbol": symbol, "max_raw_age_ms": 0.0,
+                            })
+                            lag_row["affected_symbols"] += 1
+                            lag_row["max_raw_age_ms"] = max(
+                                lag_row["max_raw_age_ms"], round(age_ms, 1)
                             )
+                            if lag > lag_row["max_lag_ms"]:
+                                lag_row["max_lag_ms"] = round(lag, 1)
+                                lag_row["max_lag_symbol"] = symbol
                             continue
                     self.sequence += 1
                     quote = BookQuote(
@@ -1736,6 +1761,10 @@ class LatestQuotePipeline:
                         "invalid_bbo", connection=raw.connection_key,
                         symbol=raw.symbol, error=f"{type(exc).__name__}: {exc}",
                     )
+            for connection_key, lag_row in cycle_lags.items():
+                self.diagnostics.emit(
+                    "transport_lag_batch", connection=connection_key, **lag_row
+                )
             elapsed_ms = (time.monotonic() - cycle_started) * 1000
             if elapsed_ms > max(100, interval * 1000):
                 self.diagnostics.emit(
@@ -1803,6 +1832,18 @@ class LatestBBOConnection(ClientConnection):
         self.connection_token = object()
         self.fragments: list[bytes] = []
         self.last_message_at = time.monotonic()
+
+    def data_received(self, data: bytes) -> None:
+        started = time.monotonic()
+        try:
+            super().data_received(data)
+        finally:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            if self.pipeline is not None and elapsed_ms >= 100:
+                self.pipeline.diagnostics.emit(
+                    "slow_ws_callback", connection=self.connection_key,
+                    duration_ms=round(elapsed_ms, 1), bytes=len(data),
+                )
 
     def process_event(self, event: Any) -> None:
         if self.response is not None and isinstance(event, Frame) and event.opcode in (
@@ -1906,6 +1947,7 @@ async def consume_book_chunk(
     while not stop.is_set():
         try:
             runtime = runtime_manager.current if runtime_manager is not None else RuntimeConfig()
+            connect_started = time.monotonic()
             async with websockets.connect(
                 url, **(await state.connection_options(url)),
                 create_connection=partial(
@@ -1913,6 +1955,11 @@ async def consume_book_chunk(
                     connection_key=error_key, allowed_symbols=allowed_symbols,
                 ),
             ) as websocket:
+                if pipeline is not None:
+                    pipeline.diagnostics.emit(
+                        "connection_open", connection=error_key,
+                        duration_ms=round((time.monotonic() - connect_started) * 1000, 1),
+                    )
                 direct = isinstance(websocket, LatestBBOConnection)
                 buffer = websocket.raw_buffer if direct else RawMessageBuffer(512)
                 if pipeline is None:
@@ -2399,8 +2446,12 @@ class MarketNetworkWorker:
         state.set_pairing_config(self.filters.current)
         tasks = [
             asyncio.create_task(monitor_loop_lag(state, stop, diagnostics)),
-            asyncio.create_task(consume_tickers(SPOT_TICKER_STREAM, "spot", state, stop)),
-            asyncio.create_task(consume_tickers(FUTURES_TICKER_STREAM, "futures", state, stop)),
+            asyncio.create_task(consume_tickers(
+                SPOT_TICKER_STREAM, "spot", state, stop, diagnostics
+            )),
+            asyncio.create_task(consume_tickers(
+                FUTURES_TICKER_STREAM, "futures", state, stop, diagnostics
+            )),
             asyncio.create_task(consume_books(
                 "spot", state, self.filters, self.runtime, stop, pipeline
             )),
