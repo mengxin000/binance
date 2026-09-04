@@ -20,6 +20,7 @@ from main import (
     QuantileWorker,
     StatisticsEngine,
     StatisticsConfig,
+    RuntimeConfig,
     format_quote_volume,
     table_row,
     terminal_width,
@@ -28,6 +29,9 @@ from main import (
     RawMessageBuffer,
     decode_raw_books,
     receive_raw_books,
+    LatestQuotePipeline,
+    NetworkDiagnostics,
+    extract_combined_stream_symbol,
 )
 
 
@@ -511,6 +515,48 @@ class BookConnectionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RawPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_latest_symbol_slot_coalesces_before_json_parse(self):
+        class Manager:
+            current = RuntimeConfig(raw_coalesce_interval_ms=100)
+
+        diagnostics = NetworkDiagnostics(None, 1_000_000)
+        pipeline = LatestQuotePipeline(Manager(), diagnostics)
+        token = object()
+        try:
+            for index in range(100):
+                payload = json.dumps({
+                    "stream": "btcusdt@bookTicker",
+                    "data": {"s": "BTCUSDT", "b": str(100 + index),
+                             "a": str(101 + index), "E": int(time.time() * 1000)},
+                }).encode()
+                pipeline.put(
+                    "futures", "futures_book_1", token,
+                    frozenset({"BTCUSDT"}), payload,
+                    time.monotonic(), time.time() * 1000,
+                )
+            await asyncio.sleep(0.25)
+            state = MarketState()
+            pipeline.apply_latest(state)
+            metrics = pipeline.metrics()
+            self.assertEqual(metrics["received"], 100)
+            self.assertEqual(metrics["overwritten"], 99)
+            self.assertEqual(metrics["parsed"], 1)
+            self.assertEqual(state.futures_books["BTCUSDT"].bid, 199)
+            self.assertGreater(state.futures_books["BTCUSDT"].version, 0)
+        finally:
+            pipeline.close()
+            diagnostics.close()
+
+    async def test_combined_stream_identity_is_allowlisted(self):
+        payload = b'{"stream":"suiusdt@bookTicker","data":{"s":"SUIUSDT"}}'
+        self.assertEqual(
+            extract_combined_stream_symbol(payload, frozenset({"SUIUSDT"})),
+            "SUIUSDT",
+        )
+        self.assertIsNone(extract_combined_stream_symbol(
+            payload, frozenset({"BTCUSDT", "ETHUSDT"})
+        ))
+
     async def test_receiver_drops_old_raw_frames_without_json_parsing(self):
         buffer = RawMessageBuffer(8)
         stop = asyncio.Event()

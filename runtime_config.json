@@ -9,7 +9,7 @@
   "quantile_refresh_seconds": 15.0,
   "background_write_queue_size": 10000,
   "book_symbols_per_connection": 80,
-  "raw_message_capacity": 1024,
-  "decode_batch_size": 128,
+  "raw_coalesce_interval_ms": 200,
+  "network_log_max_bytes": 20000000,
   "data_directory": "data"
 }
