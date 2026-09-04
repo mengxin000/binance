@@ -27,11 +27,11 @@ basis_bps = (normalized_futures_mid / BTCUSDT spot_mid - 1) × 10000
 
 反方向 `BTCUSDC` 现货与 `BTCUSDT` 永续使用除法折算。转换盘口也受行情新鲜度检查；转换价格过期时不产生样本。
 
-全部市场网络收发运行在独立线程/事件循环。`LatestBBOConnection` 重组完整消息后只提取 combined stream 名称，并覆盖 `(market, symbol)` 对应的唯一未解析槽；同一symbol在下一解析周期前到来的中间BBO不会执行完整JSON解析。它不经过 websockets 默认的 Assembler 数据帧FIFO，避免高水位触发 `pause_reading()`。分片必须重组完整才覆盖；Ping/Pong、Close及协议校验仍交给库处理。该适配仅适用于完整BBO快照，不能用于增量深度流；依赖限定为websockets 15.x。
+现货BBO、永续BBO分别运行在独立线程和Event Loop，低频ticker运行在第三个协调循环；任一现货同步回调不能再占用永续Event Loop。`LatestBBOConnection` 重组完整消息后只提取combined stream名称，并覆盖 `(market, symbol)` 对应的唯一未解析槽；同一symbol在下一解析周期前到来的中间BBO不会执行完整JSON解析。它不经过websockets默认的Assembler数据帧FIFO。分片必须重组完整才覆盖；Ping/Pong、Close及协议校验仍交给库处理。该适配仅适用于完整BBO快照，不能用于增量深度流；依赖限定为websockets 15.x。
 
 独立解析线程每 `raw_coalesce_interval_ms`（当前200ms）取走所有发生变化的symbol，并且每个symbol只解析最后一条；随后用不可变 `BookQuote` 覆盖已解析状态并递增版本号。策略每 `sample_interval_ms`（当前1000ms）读取最新状态：路线版本未变时复用缓存基差，但固定时间样本仍正常写入，避免把时间分布错误变成消息频率分布。行情年龄和跨腿时间差每个采样点都重新检查，过期样本跳过且不回补。P5～P95仅在统计样本版本变化时重算。
 
-TLS上下文在后台创建一次并由所有WSS连接复用，避免Windows证书加载阻塞网络循环。网络诊断由独立写线程轮转写入 `data/diagnostics/network_pipeline.jsonl`，记录60秒汇总、网络循环停顿、解析周期超时、无效BBO、永续E延迟及连接重试；最多约 `network_log_max_bytes × 3`，日志队列满时丢日志而不阻塞行情。该设计仍不是网络无延迟保证：TCP/TLS、WebSocket解帧、CPU/GIL或线路停顿仍可能影响接收。
+每个网络循环的TLS上下文在后台创建一次并在该循环内复用，BBO连接禁用per-message deflate以减少弱CPU上的同步解压工作。网络诊断由独立写线程轮转写入 `data/diagnostics/network_pipeline.jsonl`，记录60秒汇总、按spot/futures/ticker区分的网络循环停顿、单次WebSocket回调耗时与消息数、解析周期超时、永续E延迟及连接重试；最多约 `network_log_max_bytes × 3`，日志队列满时丢日志而不阻塞行情。该设计仍不是网络无延迟保证：三个线程仍共享Python GIL，CPU/GIL或操作系统停顿仍可能影响全部线程。
 
 每条路线只维护一个总样本滑动队列。μ、σ使用滚动和，运行范围使用单调队列，更新均为均摊O(1)。P5～P95由NumPy后台精确计算（linear插值）：每轮逐交易对复制必要的长窗尾部，再让出事件循环，不一次复制全部交易对。每隔 `quantile_refresh_seconds` 启动一轮，未结束不排队。终端格式化和输出均在独立线程，使用轻量展示快照。窗口未装满时使用已有样本。
 
@@ -102,14 +102,14 @@ spread_bps = (USDC永续折算价 / USDT永续mid - 1) × 10000
   "persist_interval_seconds": 60.0,
   "quantile_refresh_seconds": 15.0,
   "background_write_queue_size": 10000,
-  "book_symbols_per_connection": 80,
+  "book_symbols_per_connection": 20,
   "raw_coalesce_interval_ms": 200,
   "network_log_max_bytes": 20000000,
   "data_directory": "data"
 }
 ```
 
-配置文件在后台读取并热加载。数据目录、写盘队列容量和日志文件上限修改需重启；合并解析周期可热加载。写盘队列满时所有新任务均不等待并计数丢弃（包括机会记录，因此落盘不保证完整）。每条bookTicker连接最多订阅 `book_symbols_per_connection` 个合约并独立退避重连。终端显示待解析symbol、累计接收、覆盖旧值、实际解析、过期、无效、E超限以及主/网络循环延迟。覆盖旧值是预期的合并行为，不代表丢失策略样本；`positive_basis_only=true` 仅展示和保存均值为正的交易对。
+配置文件在后台读取并热加载。数据目录、写盘队列容量和日志文件上限修改需重启；合并解析周期可热加载。写盘队列满时所有新任务均不等待并计数丢弃（包括机会记录，因此落盘不保证完整）。每条bookTicker连接最多订阅 `book_symbols_per_connection` 个合约并独立退避重连；默认20，用更多连接换取更小的单次回调批量。终端分别显示现货、永续和ticker循环的当前/峰值延迟及连接数。覆盖旧值是预期的合并行为，不代表丢失策略样本；`positive_basis_only=true` 仅展示和保存均值为正的交易对。
 
 接收链路回归测试：`python -m unittest test_main test_network -v`。`test_network.py` 使用真实本地WebSocket服务，覆盖同symbol覆盖100次仅解析最后一条、最新消息、分片重组、Ping/Pong、远端关闭、E超限重连，以及主线程暂停时网络仍更新；不是Binance现场网络压测。
 

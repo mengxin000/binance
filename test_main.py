@@ -32,6 +32,7 @@ from main import (
     LatestQuotePipeline,
     NetworkDiagnostics,
     extract_combined_stream_symbol,
+    BBOIngressWorker,
 )
 
 
@@ -515,6 +516,28 @@ class BookConnectionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RawPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_spot_and_futures_bbo_use_distinct_network_threads(self):
+        class Manager:
+            current = RuntimeConfig()
+
+        diagnostics = NetworkDiagnostics(None, 1_000_000)
+        pipeline = LatestQuotePipeline(Manager(), diagnostics)
+        spot = BBOIngressWorker("spot", Manager(), pipeline, diagnostics)
+        futures = BBOIngressWorker("futures", Manager(), pipeline, diagnostics)
+        try:
+            spot.start()
+            futures.start()
+            async with asyncio.timeout(2):
+                while spot.thread_id is None or futures.thread_id is None:
+                    await asyncio.sleep(0.01)
+            self.assertNotEqual(spot.thread_id, futures.thread_id)
+        finally:
+            await asyncio.gather(
+                asyncio.to_thread(spot.close), asyncio.to_thread(futures.close)
+            )
+            pipeline.close()
+            diagnostics.close()
+
     async def test_latest_symbol_slot_coalesces_before_json_parse(self):
         class Manager:
             current = RuntimeConfig(raw_coalesce_interval_ms=100)

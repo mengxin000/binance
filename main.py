@@ -37,6 +37,8 @@ FUTURES_BOOK_BASE = "wss://fstream.binance.com/public/stream?streams="
 # 禁用客户端额外 Ping，避免本地 ping_timeout 以 1011 主动断开连接。
 BINANCE_WEBSOCKET_OPTIONS = {
     "proxy": None,
+    # BBO messages are tiny; avoid synchronous per-message deflate work on weak CPUs.
+    "compression": None,
     "open_timeout": 20,
     "ping_interval": None,
     "ping_timeout": None,
@@ -137,7 +139,7 @@ class RuntimeConfig:
     persist_interval_seconds: float = 60.0
     quantile_refresh_seconds: float = 15.0
     background_write_queue_size: int = 10_000
-    book_symbols_per_connection: int = 80
+    book_symbols_per_connection: int = 20
     raw_coalesce_interval_ms: int = 200
     network_log_max_bytes: int = 20_000_000
     data_directory: str = "data"
@@ -1832,9 +1834,11 @@ class LatestBBOConnection(ClientConnection):
         self.connection_token = object()
         self.fragments: list[bytes] = []
         self.last_message_at = time.monotonic()
+        self.complete_messages = 0
 
     def data_received(self, data: bytes) -> None:
         started = time.monotonic()
+        messages_before = self.complete_messages
         try:
             super().data_received(data)
         finally:
@@ -1843,6 +1847,7 @@ class LatestBBOConnection(ClientConnection):
                 self.pipeline.diagnostics.emit(
                     "slow_ws_callback", connection=self.connection_key,
                     duration_ms=round(elapsed_ms, 1), bytes=len(data),
+                    messages=self.complete_messages - messages_before,
                 )
 
     def process_event(self, event: Any) -> None:
@@ -1851,6 +1856,7 @@ class LatestBBOConnection(ClientConnection):
         ):
             self.fragments.append(bytes(event.data))
             if event.fin:
+                self.complete_messages += 1
                 payload = b"".join(self.fragments)
                 self.fragments.clear()
                 self.last_message_at = time.monotonic()
@@ -2128,14 +2134,21 @@ def pipeline_status(state: MarketState) -> str:
     return (
         pipeline +
         f"主循环延迟: {state.loop_lag_ms:.1f}ms / 峰值 {state.max_loop_lag_ms:.1f}ms | "
-        f"网络循环延迟: {getattr(state, 'network_loop_lag_ms', 0):.1f}ms / "
-        f"峰值 {getattr(state, 'network_max_loop_lag_ms', 0):.1f}ms"
+        f"现货网络: {getattr(state, 'spot_network_loop_lag_ms', 0):.1f}/"
+        f"{getattr(state, 'spot_network_max_loop_lag_ms', 0):.1f}ms "
+        f"({getattr(state, 'spot_network_connections', 0)}连接) | "
+        f"永续网络: {getattr(state, 'futures_network_loop_lag_ms', 0):.1f}/"
+        f"{getattr(state, 'futures_network_max_loop_lag_ms', 0):.1f}ms "
+        f"({getattr(state, 'futures_network_connections', 0)}连接) | "
+        f"ticker网络: {getattr(state, 'ticker_loop_lag_ms', 0):.1f}/"
+        f"{getattr(state, 'ticker_max_loop_lag_ms', 0):.1f}ms"
     )
 
 
 async def monitor_loop_lag(
     state: MarketState, stop: asyncio.Event,
     diagnostics: NetworkDiagnostics | None = None,
+    component: str = "main",
 ) -> None:
     while not stop.is_set():
         expected = time.monotonic() + 0.1
@@ -2145,7 +2158,7 @@ async def monitor_loop_lag(
         if diagnostics is not None and state.loop_lag_ms >= 500:
             diagnostics.emit(
                 "network_loop_stall", delay_ms=round(state.loop_lag_ms, 1),
-                peak_ms=round(state.max_loop_lag_ms, 1),
+                peak_ms=round(state.max_loop_lag_ms, 1), component=component,
             )
 
 
@@ -2405,6 +2418,135 @@ async def resize_statistics_windows(engine: StatisticsEngine, size: int) -> None
             await asyncio.sleep(0)
 
 
+class BBOIngressWorker:
+    """One market's BBO sockets on an isolated thread and event loop."""
+
+    def __init__(
+        self, market: str, runtime: Any, pipeline: LatestQuotePipeline,
+        diagnostics: NetworkDiagnostics,
+    ) -> None:
+        self.market, self.runtime = market, runtime
+        self.pipeline, self.diagnostics = pipeline, diagnostics
+        self._desired_lock = threading.Lock()
+        self._desired_symbols: tuple[str, ...] = ()
+        self._status_lock = threading.Lock()
+        self._status: dict[str, Any] = {
+            "connected": False, "errors": {}, "loop_lag_ms": 0.0,
+            "max_loop_lag_ms": 0.0, "connections": 0,
+        }
+        self._exit = threading.Event()
+        self.error: BaseException | None = None
+        self.thread_id: int | None = None
+        self._thread = threading.Thread(
+            target=self._run, name=f"{market}-bbo-network", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def set_symbols(self, symbols: set[str]) -> None:
+        updated = tuple(sorted(symbols))
+        with self._desired_lock:
+            self._desired_symbols = updated
+
+    def _get_symbols(self) -> tuple[str, ...]:
+        with self._desired_lock:
+            return self._desired_symbols
+
+    def _run(self) -> None:
+        self.thread_id = threading.get_ident()
+        try:
+            asyncio.run(self._serve())
+        except BaseException as exc:
+            self.error = exc
+
+    async def _serve(self) -> None:
+        state, stop = MarketState(), asyncio.Event()
+        lag_task = asyncio.create_task(monitor_loop_lag(
+            state, stop, self.diagnostics, self.market,
+        ))
+        connection_tasks: list[asyncio.Task[Any]] = []
+        active_symbols: tuple[str, ...] = ()
+        active_chunk_size = 0
+        try:
+            while not self._exit.is_set():
+                desired = self._get_symbols()
+                chunk_size = self.runtime.current.book_symbols_per_connection
+                if desired != active_symbols or chunk_size != active_chunk_size:
+                    for task in connection_tasks:
+                        task.cancel()
+                    await asyncio.gather(*connection_tasks, return_exceptions=True)
+                    connection_tasks = []
+                    state.book_connected_chunks[self.market].clear()
+                    state.book_connected[self.market] = False
+                    for key in list(state.errors):
+                        if key.startswith(f"{self.market}_book_"):
+                            state.errors.pop(key, None)
+                    chunks = [
+                        desired[index:index + chunk_size]
+                        for index in range(0, len(desired), chunk_size)
+                    ]
+                    base_url = SPOT_BOOK_BASE if self.market == "spot" else FUTURES_BOOK_BASE
+                    connection_tasks = [
+                        asyncio.create_task(consume_book_chunk(
+                            base_url + "/".join(
+                                f"{symbol.lower()}@bookTicker" for symbol in chunk
+                            ),
+                            self.market, str(index), state, stop, self.runtime,
+                            self.pipeline, frozenset(chunk),
+                        ))
+                        for index, chunk in enumerate(chunks, 1)
+                    ]
+                    active_symbols, active_chunk_size = desired, chunk_size
+                    self.diagnostics.emit(
+                        "subscription_rebuild", component=self.market,
+                        symbols=len(desired), connections=len(chunks),
+                        symbols_per_connection=chunk_size,
+                    )
+                for task in connection_tasks:
+                    if task.done():
+                        task.result()
+                        raise RuntimeError(f"{self.market} BBO连接任务意外停止")
+                expected = len(connection_tasks)
+                connected = (
+                    expected > 0
+                    and len(state.book_connected_chunks[self.market]) == expected
+                )
+                errors = {
+                    key: value for key, value in state.errors.items()
+                    if key.startswith(f"{self.market}_book") and value
+                }
+                with self._status_lock:
+                    self._status = {
+                        "connected": connected, "errors": errors,
+                        "loop_lag_ms": state.loop_lag_ms,
+                        "max_loop_lag_ms": state.max_loop_lag_ms,
+                        "connections": expected,
+                    }
+                await asyncio.sleep(0.05)
+        finally:
+            stop.set()
+            for task in connection_tasks:
+                task.cancel()
+            lag_task.cancel()
+            await asyncio.gather(*connection_tasks, lag_task, return_exceptions=True)
+
+    def status(self) -> dict[str, Any]:
+        if self.error is not None:
+            raise RuntimeError(f"{self.market} BBO网络线程退出") from self.error
+        with self._status_lock:
+            return {
+                key: value.copy() if isinstance(value, dict) else value
+                for key, value in self._status.items()
+            }
+
+    def close(self) -> None:
+        self._exit.set()
+        self._thread.join(timeout=8)
+        if self._thread.is_alive():
+            raise RuntimeError(f"{self.market} BBO网络线程未在8秒内退出")
+
+
 class MarketNetworkWorker:
     """Own all sockets on a dedicated loop; publish latest state, never a backlog.
 
@@ -2438,6 +2580,10 @@ class MarketNetworkWorker:
             self.runtime.current.network_log_max_bytes,
         )
         pipeline = LatestQuotePipeline(self.runtime, diagnostics)
+        spot_ingress = BBOIngressWorker("spot", self.runtime, pipeline, diagnostics)
+        futures_ingress = BBOIngressWorker("futures", self.runtime, pipeline, diagnostics)
+        spot_ingress.start()
+        futures_ingress.start()
         diagnostics.emit(
             "pipeline_start",
             coalesce_interval_ms=self.runtime.current.raw_coalesce_interval_ms,
@@ -2445,20 +2591,18 @@ class MarketNetworkWorker:
         )
         state.set_pairing_config(self.filters.current)
         tasks = [
-            asyncio.create_task(monitor_loop_lag(state, stop, diagnostics)),
+            asyncio.create_task(monitor_loop_lag(state, stop, diagnostics, "ticker")),
             asyncio.create_task(consume_tickers(
                 SPOT_TICKER_STREAM, "spot", state, stop, diagnostics
             )),
             asyncio.create_task(consume_tickers(
                 FUTURES_TICKER_STREAM, "futures", state, stop, diagnostics
             )),
-            asyncio.create_task(consume_books(
-                "spot", state, self.filters, self.runtime, stop, pipeline
-            )),
-            asyncio.create_task(consume_books(
-                "futures", state, self.filters, self.runtime, stop, pipeline
-            )),
         ]
+        spot_status = futures_status = {
+            "connected": False, "errors": {}, "loop_lag_ms": 0.0,
+            "max_loop_lag_ms": 0.0, "connections": 0,
+        }
         try:
             while not self._exit.is_set():
                 for task in tasks:
@@ -2469,6 +2613,21 @@ class MarketNetworkWorker:
                     raise RuntimeError(f"BBO解析线程退出: {pipeline.error}")
                 state.set_pairing_config(self.filters.current)
                 state.max_transport_lag_ms = self.runtime.current.max_transport_lag_ms
+                spot_ingress.set_symbols(
+                    state.book_symbols("spot", self.filters.current)
+                )
+                futures_ingress.set_symbols(
+                    state.book_symbols("futures", self.filters.current)
+                )
+                spot_status = spot_ingress.status()
+                futures_status = futures_ingress.status()
+                state.book_connected["spot"] = spot_status["connected"]
+                state.book_connected["futures"] = futures_status["connected"]
+                for key in list(state.errors):
+                    if key.startswith("spot_book_") or key.startswith("futures_book_"):
+                        state.errors.pop(key, None)
+                state.errors.update(spot_status["errors"])
+                state.errors.update(futures_status["errors"])
                 pipeline.apply_latest(state)
                 if diagnostics.error:
                     state.errors["network_log"] = diagnostics.error
@@ -2478,8 +2637,14 @@ class MarketNetworkWorker:
                     "book_last_update", "errors",
                 )}
                 snapshot.update(pipeline_metrics=pipeline.metrics(),
-                                network_loop_lag_ms=state.loop_lag_ms,
-                                network_max_loop_lag_ms=state.max_loop_lag_ms)
+                                ticker_loop_lag_ms=state.loop_lag_ms,
+                                ticker_max_loop_lag_ms=state.max_loop_lag_ms,
+                                spot_network_loop_lag_ms=spot_status["loop_lag_ms"],
+                                spot_network_max_loop_lag_ms=spot_status["max_loop_lag_ms"],
+                                futures_network_loop_lag_ms=futures_status["loop_lag_ms"],
+                                futures_network_max_loop_lag_ms=futures_status["max_loop_lag_ms"],
+                                spot_network_connections=spot_status["connections"],
+                                futures_network_connections=futures_status["connections"])
                 with self._lock:
                     self._snapshot = snapshot
                 await asyncio.sleep(0.05)
@@ -2488,10 +2653,16 @@ class MarketNetworkWorker:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(
+                asyncio.to_thread(spot_ingress.close),
+                asyncio.to_thread(futures_ingress.close),
+            )
             await asyncio.to_thread(pipeline.close)
             diagnostics.emit(
                 "pipeline_stop", **pipeline.metrics(),
-                network_loop_peak_ms=round(state.max_loop_lag_ms, 1),
+                ticker_loop_peak_ms=round(state.max_loop_lag_ms, 1),
+                spot_loop_peak_ms=round(spot_status.get("max_loop_lag_ms", 0), 1),
+                futures_loop_peak_ms=round(futures_status.get("max_loop_lag_ms", 0), 1),
             )
             await asyncio.to_thread(diagnostics.close)
 
