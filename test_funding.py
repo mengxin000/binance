@@ -1,67 +1,117 @@
-import requests
-import pandas as pd
-from datetime import datetime, timedelta
+import time
+import unittest
+from monitor.terminal.pages import funding_snapshot
 
-def fetch_funding_rate(symbol, limit=1000):
-    """获取单个交易对的历史资金费率"""
-    resp = requests.get(
-        "https://fapi.binance.com/fapi/v1/fundingRate",
-        params={"symbol": symbol, "limit": limit},
-    )
-    return resp.json()
-
-# 示例：获取BTCUSDT的数据
-btc_data = fetch_funding_rate("BTCUSDT", 30)
-
-# 将数据转换为DataFrame，便于处理
-df = pd.DataFrame(btc_data)
-df['fundingRate'] = df['fundingRate'].astype(float)
-df['fundingTime'] = pd.to_datetime(df['fundingTime'], unit='ms')
-# print(df.head())
-
-
-def get_usdt_futures_symbols():
-    """获取所有U本位永续合约的交易对名称"""
-    resp = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo")
-    data = resp.json()
-    # 筛选出状态为 'TRADING' 的交易对
-    symbols = [
-        s['symbol'] for s in data['symbols']
-        if s['status'] == 'TRADING' and s['contractType'] == 'PERPETUAL'
-    ]
-    return symbols
+from main import (
+    BookQuote,
+    FilterConfig,
+    FundingConfig,
+    FundingPayment,
+    FundingQuote,
+    MarketState,
+    RuntimeConfig,
+    StatisticsConfig,
+    StatisticsEngine,
+    VolumeTicker,
+    calculate_funding_statistics,
+    parse_funding_history,
+    render_funding,
+)
 
 
-# 注意：以下循环会请求大量API，建议仅用于测试
-# 实际使用时应控制请求频率，或仅获取你关注的交易对列表
-all_symbols = get_usdt_futures_symbols()
-# all_symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT']  # 先测试少量交易对
+class FundingStatisticsTests(unittest.TestCase):
+    def test_live_rate_visible_without_history_and_stale_rate_hidden(self):
+        state = MarketState()
+        state.funding_quotes["AAAUSDT"] = FundingQuote(
+            0.0002, 123, 100, time.monotonic()
+        )
+        result = funding_snapshot(state, "AAAUSDT", FundingConfig())
+        self.assertEqual(result[0], "+2.00bp")
+        self.assertEqual(result[1], "--")
+        self.assertIsNone(result[2])
+        self.assertIsNone(result[3])
+        state.funding_quotes["AAAUSDT"].received_at -= 20
+        self.assertEqual(funding_snapshot(state, "AAAUSDT", FundingConfig())[0], "--")
 
-results = []
+    def test_time_weighted_average_normalizes_mixed_intervals(self):
+        hour = 3_600_000
+        records = [
+            FundingPayment(0, 0.0001),
+            FundingPayment(4 * hour, 0.0001),
+            FundingPayment(8 * hour, -0.00005),
+        ]
+        stats = calculate_funding_statistics("AAAUSDT", records, 0.0)
+        self.assertIsNotNone(stats)
+        assert stats is not None
+        self.assertAlmostEqual(stats.average_bps_8h, 1.0)
+        self.assertAlmostEqual(stats.positive_average_bps_8h, 2.0)
+        self.assertAlmostEqual(stats.negative_average_bps_8h, -1.0)
+        self.assertAlmostEqual(stats.positive_time_ratio, 2 / 3)
 
-test_symbols = all_symbols[:20]
+    def test_current_rate_uses_next_settlement_interval(self):
+        hour = 3_600_000
+        records = [FundingPayment(0, 0.0001), FundingPayment(4 * hour, 0.0001)]
+        stats = calculate_funding_statistics("AAAUSDT", records)
+        assert stats is not None
+        quote = FundingQuote(0.0001, 8 * hour, 0, time.monotonic())
+        self.assertAlmostEqual(stats.current_bps_8h(quote), 2.0)
 
-for symbol in test_symbols:
-    try:
-        data = fetch_funding_rate(symbol, 30)  # 获取最近30条记录
+    def test_percentile_and_censored_direction_streak(self):
+        hour = 3_600_000
+        records = [
+            FundingPayment(0, 0.00005),
+            FundingPayment(8 * hour, 0.0001),
+            FundingPayment(16 * hour, 0.0002),
+        ]
+        stats = calculate_funding_statistics("AAAUSDT", records, 0.05)
+        assert stats is not None
+        self.assertAlmostEqual(stats.percentile(1.0), 2 / 3)
+        streak = stats.direction_streak_seconds(1.0, 0.05, 24 * hour)
+        self.assertEqual(streak, (1, 24 * 3600.0, True))
 
-        # 数据清洗，转换为浮点数
-        rates = [float(item['fundingRate']) for item in data]
+    def test_history_parser_ignores_invalid_rows(self):
+        rows = parse_funding_history([
+            {"fundingTime": 1000, "fundingRate": "0.0001"},
+            {"bad": "row"},
+        ])
+        self.assertEqual(rows, [FundingPayment(1000, 0.0001)])
 
-        # 筛选条件：30条记录必须都存在，且全部大于0
-        if len(rates) == 30 and all(rate > 0 for rate in rates):
-            avg_rate = sum(rates) / len(rates)
-            results.append({
-                "symbol": symbol,
-                "avg_funding_rate": avg_rate,
-                "positive_count": len([r for r in rates if r > 0])
-            })
-    except Exception as e:
-        print(f"处理 {symbol} 时出错: {e}")
+    def test_funding_page_renders_an_eligible_pair(self):
+        now_mono = time.monotonic()
+        now_ms = int(time.time() * 1000)
+        hour = 3_600_000
+        state = MarketState()
+        filters = FilterConfig()
+        state.set_pairing_config(filters)
+        state.spot_volumes["AAAUSDT"] = VolumeTicker(20_000_000)
+        state.futures_volumes["AAAUSDT"] = VolumeTicker(30_000_000)
+        state.spot_books["AAAUSDT"] = BookQuote(1.0, 1.01, now_mono)
+        state.futures_books["AAAUSDT"] = BookQuote(1.01, 1.02, now_mono)
+        records = [
+            FundingPayment(now_ms - 16 * hour, 0.0001),
+            FundingPayment(now_ms - 8 * hour, 0.0001),
+            FundingPayment(now_ms, 0.0001),
+        ]
+        history = calculate_funding_statistics("AAAUSDT", records)
+        assert history is not None
+        state.funding_statistics["AAAUSDT"] = history
+        state.funding_quotes["AAAUSDT"] = FundingQuote(
+            0.0001, now_ms + 8 * hour, now_ms, now_mono
+        )
+        output = render_funding(
+            state, StatisticsEngine(), filters, StatisticsConfig(),
+            FundingConfig(), RuntimeConfig(), now_mono, [],
+        )
+        self.assertIn("AAAUSDT", output)
+        self.assertIn("+1.00bp", output)
+        state.funding_statistics.clear()
+        pending = render_funding(
+            state, StatisticsEngine(), filters, StatisticsConfig(),
+            FundingConfig(), RuntimeConfig(), now_mono, [],
+        )
+        self.assertIn("AAAUSDT", pending)
+        self.assertIn("+1.00bp", pending)
 
-# 按平均费率降序排序（费率高的排在前面）
-sorted_results = sorted(results, key=lambda x: x['avg_funding_rate'], reverse=True)
 
-# 打印结果
-for res in sorted_results:
-    print(f"交易对: {res['symbol']}, 30日平均正费率: {res['avg_funding_rate']:.6f}")
+if __name__ == "__main__":
+    unittest.main()

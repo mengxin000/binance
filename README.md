@@ -1,8 +1,8 @@
 # Binance 现货－永续基差波动筛选器
 
-从 Binance 现货与 USDT-M 永续全市场中筛选流动性达标且基差波动空间足够的交易对。可选正基差条件；程序只统计，不需要 API Key、不下单，也不估算收益。
+从 Binance 现货与USDT/USDC本位永续全市场中筛选基差波动机会，并独立筛选适合研究长期资金费率套利的交易对。程序只统计，不需要 API Key、不下单，也不估算账户级净收益。
 
-直接在 Python IDE 中运行 `main.py`。需要长期运行时启动 `guardian.py`；主程序异常退出后，守护程序会等待3秒并自动重启，按 Ctrl+C 可同时停止。运行期间按 `K` 在“现货－永续”和“USDT永续－USDC永续”两个独立页面之间切换。
+直接在 Python IDE 中运行 `main.py`。需要长期运行时启动 `guardian.py`；主程序异常退出后，守护程序会等待3秒并自动重启，按 Ctrl+C 可同时停止。运行期间按 `K` 循环切换“现货－永续基差”“USDT永续－USDC永续基差”和“资金费率套利”三个页面。
 
 ## 数据口径
 
@@ -44,14 +44,12 @@ basis_bps = (normalized_futures_mid / BTCUSDT spot_mid - 1) × 10000
 
 ## 配置
 
-`filter_config.json`：
+`config/market.json`：
 
 ```json
 {
   "min_spot_volume": 10000000,
   "min_futures_volume": 10000000,
-  "top": 10,
-  "positive_basis_only": true,
   "min_spot_price": 0.1,
   "quote_assets": ["USDT", "USDC"],
   "cross_quote_pairings": [
@@ -63,10 +61,12 @@ basis_bps = (normalized_futures_mid / BTCUSDT spot_mid - 1) × 10000
 
 `min_spot_price` 使用现货实时 bookTicker 中间价。`quote_assets` 控制同报价币种配对；`cross_quote_pairings` 明确允许的跨币种方向，每项顺序固定为 `[现货报价币种, 永续报价币种]`。上面的配置同时生成 `BTCUSDT/BTCUSDC` 与 `BTCUSDC/BTCUSDT`，不存在任意币种的隐式组合。
 
-`statistics_config.json`：
+`config/basis_spot_futures.json`：
 
 ```json
 {
+  "top": 40,
+  "positive_basis_only": false,
   "total_window_samples": 432000,
   "long_window_samples": 144000,
   "short_window_samples": 54000,
@@ -82,14 +82,14 @@ basis_bps = (normalized_futures_mid / BTCUSDT spot_mid - 1) × 10000
 
 三个窗口样本数、分位数、k值和上下事件阈值均支持热加载。必须满足 `short_window_samples <= long_window_samples <= total_window_samples`。
 
-`futures_futures_statistics_config.json` 使用相同字段，独立控制USDT永续－USDC永续页面；两套参数、滑动样本、机会计数和排名互不影响。期货间价差统一定义为：
+`config/basis_futures_futures.json` 使用相同字段，独立控制USDT永续－USDC永续页面；两套参数、滑动样本、机会计数和排名互不影响。期货间价差统一定义为：
 
 ```text
 USDC永续折算价 = USDC永续mid × USDCUSDT现货mid
 spread_bps = (USDC永续折算价 / USDT永续mid - 1) × 10000
 ```
 
-`runtime_config.json`：
+`config/runtime.json`：
 
 ```json
 {
@@ -109,7 +109,22 @@ spread_bps = (USDC永续折算价 / USDT永续mid - 1) × 10000
 }
 ```
 
-配置文件在后台读取并热加载。数据目录、写盘队列容量和日志文件上限修改需重启；合并解析周期可热加载。写盘队列满时所有新任务均不等待并计数丢弃（包括机会记录，因此落盘不保证完整）。每条bookTicker连接最多订阅 `book_symbols_per_connection` 个合约并独立退避重连；默认20，用更多连接换取更小的单次回调批量。终端分别显示现货、永续和ticker循环的当前/峰值延迟及连接数。覆盖旧值是预期的合并行为，不代表丢失策略样本；`positive_basis_only=true` 仅展示和保存均值为正的交易对。
+配置文件在后台读取并热加载。数据目录、写盘队列容量和日志文件上限修改需重启；合并解析周期可热加载。写盘队列满时所有新任务均不等待并计数丢弃（包括机会记录，因此落盘不保证完整）。每条bookTicker连接最多订阅 `book_symbols_per_connection` 个合约并独立退避重连；默认20，用更多连接换取更小的单次回调批量。终端分别显示现货、永续和ticker循环的当前/峰值延迟及连接数。覆盖旧值是预期的合并行为，不代表丢失策略样本；`config/basis_spot_futures.json` 中的 `positive_basis_only=true` 仅展示和保存均值为正的交易对。
+
+`config/funding.json`：
+
+```json
+{
+  "history_days": 30,
+  "min_abs_avg_funding_bps_8h": 0.5,
+  "neutral_band_bps_8h": 0.05,
+  "current_max_age_seconds": 10.0,
+  "history_refresh_seconds": 3600.0,
+  "top": 40
+}
+```
+
+当前资金费率来自全市场标记价格WebSocket并覆盖内存中的最新值；30日均值、正负均值、分位数、方向一致率和当前方向持续时间只使用REST接口返回的已结算资金费率。不同结算周期统一折算为 `bp/8h`。资金费率历史只为通过公共成交额与价格初筛的永续标的在后台加载，不占用BBO网络线程。基差页面显示当前资费和30日均资费；永续－永续页面显示USDC永续减USDT永续的资费差。
 
 接收链路回归测试：`python -m unittest test_main test_network -v`。`test_network.py` 使用真实本地WebSocket服务，覆盖同symbol覆盖100次仅解析最后一条、最新消息、分片重组、Ping/Pong、远端关闭、E超限重连，以及主线程暂停时网络仍更新；不是Binance现场网络压测。
 

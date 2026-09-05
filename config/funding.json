@@ -1,0 +1,8 @@
+{
+  "history_days": 30,
+  "min_abs_avg_funding_bps_8h": 0.5,
+  "neutral_band_bps_8h": 0.05,
+  "current_max_age_seconds": 10.0,
+  "history_refresh_seconds": 3600.0,
+  "top": 40
+}

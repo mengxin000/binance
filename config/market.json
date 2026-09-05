@@ -1,8 +1,6 @@
 {
   "min_spot_volume": 10000000,
   "min_futures_volume": 10000000,
-  "top": 40,
-  "positive_basis_only": false,
   "min_spot_price": 0.1,
   "quote_assets": ["USDT", "USDC"],
   "cross_quote_pairings": [

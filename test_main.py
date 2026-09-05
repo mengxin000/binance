@@ -417,12 +417,12 @@ class ConfigManagerTests(unittest.TestCase):
     def test_invalid_hot_reload_keeps_last_valid_config(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "filter.json"
-            path.write_text(json.dumps({"top": 7}), encoding="utf-8")
+            path.write_text(json.dumps({"min_spot_volume": 7}), encoding="utf-8")
             manager = ConfigManager(path, FilterConfig)
-            self.assertEqual(manager.current.top, 7)
+            self.assertEqual(manager.current.min_spot_volume, 7)
             path.write_text("{保存到一半", encoding="utf-8")
             self.assertFalse(manager.reload())
-            self.assertEqual(manager.current.top, 7)
+            self.assertEqual(manager.current.min_spot_volume, 7)
 
 
 class BookConnectionTests(unittest.IsolatedAsyncioTestCase):
@@ -595,7 +595,7 @@ class RawPipelineTests(unittest.IsolatedAsyncioTestCase):
                 self.count += 1
                 return f"not-json-{self.count}"
 
-        with mock.patch("main.json.loads", side_effect=AssertionError("receiver parsed JSON")):
+        with mock.patch("monitor.network.core.json.loads", side_effect=AssertionError("receiver parsed JSON")):
             task = asyncio.create_task(receive_raw_books(Socket(), buffer, stop))
             try:
                 await asyncio.wait_for(delivered.wait(), 5)
