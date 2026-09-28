@@ -4,5 +4,7 @@ data/
 __pycache__/
 .pytest_cache/
 *.py[cod]
-test*
+test_network.py
+test_funding.py
+test_main.py
 uv.lock

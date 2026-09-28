@@ -115,8 +115,6 @@ def render(
     rows = [
         stats for stats in rows
         if stats.symbol in state.eligible_symbols(filters)
-        and (age := state.quote_age(stats.symbol, filters)) is not None
-        and age <= runtime.stale_seconds
     ]
     lines = [
         "Binance 现货－USDT/USDC-M 永续基差波动筛选  [按 K 切换页面]",
@@ -206,7 +204,8 @@ def render(
                 f"{lower_sigma:+.2f}～{upper_sigma:+.2f}bp", short_text, long_text, runtime_text,
                 f"{stats.current_basis_bps:+.2f}bp",
                 current_funding, average_funding,
-                f"{stats.sigma_position:+.2f}σ", f"{quote_age:.1f}秒",
+                f"{stats.sigma_position:+.2f}σ",
+                f"{quote_age:.1f}秒" if quote_age is not None else "--",
                 f"{stats.open_count}次", f"{stats.close_count}次",
             ], widths, aligns))
     else:
@@ -236,8 +235,6 @@ def render_futures_futures(
     rows = [
         stats for stats in rows
         if stats.symbol in routes
-        and (age := state.futures_futures_quote_age(stats.symbol, filters)) is not None
-        and age <= runtime.stale_seconds
     ]
     lines = [
         "Binance USDT永续－USDC永续价差波动筛选  [按 K 切换页面]",
@@ -334,7 +331,8 @@ def render_futures_futures(
                 short_text, long_text, runtime_text,
                 f"{stats.current_basis_bps:+.2f}bp", current_funding_spread,
                 average_funding_spread, f"{stats.sigma_position:+.2f}σ",
-                f"{quote_age:.1f}秒", f"{stats.open_count}次", f"{stats.close_count}次",
+                f"{quote_age:.1f}秒" if quote_age is not None else "--",
+                f"{stats.open_count}次", f"{stats.close_count}次",
             ], widths, aligns))
     else:
         lines.append(

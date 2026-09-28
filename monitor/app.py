@@ -5,12 +5,12 @@ import copy
 import signal
 import time
 from collections import deque
-from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
 from typing import Any
 
-from .basis.core import (BackgroundWriter, BasisDiagnosticStore, LatestScreenWriter, PairDirectoryStore, QuantileWorker, StatisticsEngine)
+from .basis.core import (BackgroundWriter, BasisDiagnosticStore, LatestScreenWriter,
+                         QuantileWorker, StatisticsEngine)
 from .models import MarketState
 from .funding.core import FundingHistoryWorker
 from .network.core import MarketNetworkWorker, monitor_loop_lag
@@ -70,14 +70,12 @@ async def run() -> None:
     runtime_manager = ConfigManager(RUNTIME_CONFIG_PATH, RuntimeConfig)
     funding_manager = ConfigManager(FUNDING_CONFIG_PATH, FundingConfig)
     data_root = resolve_path(runtime_manager.current.data_directory)
-    store = PairDirectoryStore(data_root / "spot_futures")
-    futures_futures_store = PairDirectoryStore(data_root / "futures_futures")
     diagnostic_store = BasisDiagnosticStore(data_root / "diagnostics")
     disk_writer = BackgroundWriter(runtime_manager.current.background_write_queue_size)
     screen_writer = LatestScreenWriter()
     quantile_worker = QuantileWorker()
-    engine = StatisticsEngine(store.load())
-    futures_futures_engine = StatisticsEngine(futures_futures_store.load())
+    engine = StatisticsEngine()
+    futures_futures_engine = StatisticsEngine()
     state = MarketState()
     stop = asyncio.Event()
     state.set_pairing_config(filter_manager.current)
@@ -97,7 +95,7 @@ async def run() -> None:
     tasks = [
         asyncio.create_task(monitor_loop_lag(state, stop)),
     ]
-    last_display = last_persist = last_quantile = 0.0
+    last_display = last_quantile = 0.0
     next_sample = time.monotonic()
     current_page = "spot_futures"
     try:
@@ -151,59 +149,7 @@ async def run() -> None:
                 disk_writer.submit(
                     diagnostic_store.append_rows, diagnostic_rows, droppable=True
                 )
-            opportunities = engine.update(snapshots, sample_interval, stats_config, now_wall)
-            for symbol, opportunity in opportunities:
-                stats = engine.pairs[symbol]
-                if not stats_config.positive_basis_only or stats.mean_basis_bps > 0:
-                    disk_writer.submit(
-                        store.append_opportunity, symbol, dict(opportunity)
-                    )
-
-            # ── 现货-永续 BBO 记录（统一采样点生成，避免时间错配和队列丢弃偏差）──
-            eligible = state.eligible_symbols(filters)
-            bbo_records: list[tuple[str, dict[str, Any]]] = []
-            for key, route in state.liquid_routes(filters).items():
-                if key not in eligible:
-                    continue
-                bbo = state.get_bbo_snapshot(
-                    route, quote_max_age, quote_tolerance
-                )
-                if bbo is None:
-                    continue
-                stats = engine.pairs.get(bbo.symbol)
-                if stats is None or stats.sample_count < 1:
-                    continue
-                trigger_basis_bps = stats.mean_basis_bps + stats_config.open_threshold_bps
-                if bbo.basis_bps <= trigger_basis_bps:
-                    continue
-                if not stats.allow_bbo_record(
-                    bbo.timestamp, stats_config.bbo_record_interval_ms / 1000
-                ):
-                    continue
-                bbo_records.append((bbo.symbol, {
-                    "time": datetime.fromtimestamp(bbo.timestamp, timezone.utc).isoformat(),
-                    "source_market": bbo.source_market,
-                    "spot_symbol": bbo.spot_symbol,
-                    "futures_symbol": bbo.futures_symbol,
-                    "conversion_symbol": bbo.conversion_symbol or None,
-                    "conversion_rate": bbo.conversion_rate,
-                    "spot_bid": bbo.spot_bid,
-                    "spot_ask": bbo.spot_ask,
-                    "spot_mid": bbo.spot_mid,
-                    "futures_bid": bbo.futures_bid,
-                    "futures_ask": bbo.futures_ask,
-                    "raw_futures_mid": bbo.raw_futures_mid,
-                    "futures_mid": bbo.futures_mid,
-                    "mean_basis_bps": stats.mean_basis_bps,
-                    "standard_deviation_bps": stats.standard_deviation_bps,
-                    "trigger_basis_bps": trigger_basis_bps,
-                    "basis_bps": bbo.basis_bps,
-                    "deviation_bps": bbo.basis_bps - stats.mean_basis_bps,
-                }))
-            if bbo_records:
-                disk_writer.submit(
-                    store.append_bbo_records, bbo_records, droppable=True
-                )
+            engine.update(snapshots, sample_interval, stats_config, now_wall)
 
             # ── 永续-永续 统一采样 ──
             futures_futures_snapshots = state.futures_futures_snapshots(
@@ -218,90 +164,12 @@ async def run() -> None:
                 disk_writer.submit(
                     diagnostic_store.append_rows, diagnostic_rows, droppable=True
                 )
-            futures_futures_opportunities = futures_futures_engine.update(
+            futures_futures_engine.update(
                 futures_futures_snapshots,
                 sample_interval,
                 futures_futures_stats_config,
                 now_wall,
             )
-            for symbol, opportunity in futures_futures_opportunities:
-                disk_writer.submit(
-                    futures_futures_store.append_opportunity,
-                    symbol, dict(opportunity),
-                )
-
-            # ── 永续-永续 BBO 记录 ──
-            ff_routes = state.liquid_futures_futures_routes(filters)
-            ff_bbo_records: list[tuple[str, dict[str, Any]]] = []
-            for key, route in ff_routes.items():
-                usdt = state.futures_books.get(route.usdt_symbol)
-                usdc = state.futures_books.get(route.usdc_symbol)
-                conversion_book = state.spot_books.get(route.conversion_symbol)
-                if not usdt or not usdc or not conversion_book or conversion_book.mid <= 0:
-                    continue
-                now_mono_chk = time.monotonic()
-                valid, _, _, _ = state._quote_quality(
-                    [usdt, usdc, conversion_book], now_mono_chk,
-                    quote_max_age, quote_tolerance,
-                )
-                if not valid:
-                    continue
-                conversion_rate = (
-                    1 / conversion_book.mid
-                    if route.conversion_inverted else conversion_book.mid
-                )
-                normalized_usdc_mid = usdc.mid * conversion_rate
-                basis_bps = (normalized_usdc_mid / usdt.mid - 1) * 10_000
-                stats = futures_futures_engine.pairs.get(key)
-                if stats is None or stats.sample_count < 1:
-                    continue
-                trigger_basis_bps = stats.mean_basis_bps + futures_futures_stats_config.open_threshold_bps
-                if basis_bps <= trigger_basis_bps:
-                    continue
-                if not stats.allow_bbo_record(
-                    now_wall, futures_futures_stats_config.bbo_record_interval_ms / 1000
-                ):
-                    continue
-                ff_bbo_records.append((key, {
-                    "time": datetime.fromtimestamp(now_wall, timezone.utc).isoformat(),
-                    "source_market": "unified",
-                    "usdt_symbol": route.usdt_symbol,
-                    "usdc_symbol": route.usdc_symbol,
-                    "conversion_symbol": route.conversion_symbol or None,
-                    "conversion_rate": conversion_rate,
-                    "usdt_bid": usdt.bid,
-                    "usdt_ask": usdt.ask,
-                    "usdt_mid": usdt.mid,
-                    "usdc_bid": usdc.bid,
-                    "usdc_ask": usdc.ask,
-                    "usdc_mid": usdc.mid,
-                    "normalized_usdc_mid": normalized_usdc_mid,
-                    "mean_basis_bps": stats.mean_basis_bps,
-                    "standard_deviation_bps": stats.standard_deviation_bps,
-                    "trigger_basis_bps": trigger_basis_bps,
-                    "basis_bps": basis_bps,
-                    "deviation_bps": basis_bps - stats.mean_basis_bps,
-                }))
-            if ff_bbo_records:
-                disk_writer.submit(
-                    futures_futures_store.append_bbo_records,
-                    ff_bbo_records, droppable=True,
-                )
-
-            if now_mono - last_persist >= runtime.persist_interval_seconds:
-                disk_writer.submit(
-                    store.save_state_rows,
-                    store.snapshot_states(engine.eligible_rows(stats_config.positive_basis_only)),
-                    droppable=True,
-                )
-                disk_writer.submit(
-                    futures_futures_store.save_state_rows,
-                    futures_futures_store.snapshot_states(
-                        futures_futures_engine.eligible_rows(False)
-                    ),
-                    droppable=True,
-                )
-                last_persist = now_mono
             quantile_worker.collect()
             if now_mono - last_quantile >= runtime.quantile_refresh_seconds:
                 jobs = [
@@ -355,18 +223,6 @@ async def run() -> None:
                 pass
     finally:
         stop.set()
-        disk_writer.submit(
-            store.save_state_rows,
-            store.snapshot_states(
-                engine.eligible_rows(statistics_manager.current.positive_basis_only)
-            ),
-        )
-        disk_writer.submit(
-            futures_futures_store.save_state_rows,
-            futures_futures_store.snapshot_states(
-                futures_futures_engine.eligible_rows(False)
-            ),
-        )
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
