@@ -1,6 +1,9 @@
 import time
 import unittest
-from monitor.terminal.pages import funding_snapshot
+from types import SimpleNamespace
+from unittest import mock
+from monitor.funding.core import FundingHistoryWorker
+from monitor.terminal.pages import funding_snapshot, display_errors
 
 from main import (
     BookQuote,
@@ -20,7 +23,25 @@ from main import (
 
 
 class FundingStatisticsTests(unittest.TestCase):
-    def test_live_rate_visible_without_history_and_stale_rate_hidden(self):
+    def test_first_history_load_does_not_wait_for_machine_uptime(self):
+        client = mock.Mock()
+        client.fetch.return_value = [FundingPayment(1000, 0.0001)]
+        with mock.patch("monitor.funding.core.time.monotonic", return_value=10.0):
+            worker = FundingHistoryWorker(SimpleNamespace(current=FundingConfig()), client)
+            try:
+                worker.set_symbols({"BTCUSDT"})
+                for _ in range(100):
+                    if "BTCUSDT" in worker.snapshot()[0]:
+                        break
+                    time.sleep(0.01)
+                self.assertIn("BTCUSDT", worker.snapshot()[0])
+                worker._wake.set()
+                time.sleep(0.1)
+                client.fetch.assert_called_once_with("BTCUSDT", 30)
+            finally:
+                worker.close()
+
+    def test_live_rate_visible_without_history_and_retained_during_reconnect(self):
         state = MarketState()
         state.funding_quotes["AAAUSDT"] = FundingQuote(
             0.0002, 123, 100, time.monotonic()
@@ -31,7 +52,24 @@ class FundingStatisticsTests(unittest.TestCase):
         self.assertIsNone(result[2])
         self.assertIsNone(result[3])
         state.funding_quotes["AAAUSDT"].received_at -= 20
-        self.assertEqual(funding_snapshot(state, "AAAUSDT", FundingConfig())[0], "--")
+        state.funding_connected = False
+        retained = funding_snapshot(state, "AAAUSDT", FundingConfig())
+        self.assertEqual(retained[0], "+2.00bp")
+        self.assertGreaterEqual(retained[4], 20)
+        self.assertEqual(funding_snapshot(state, "MISSING", FundingConfig())[0], "--")
+
+    def test_transport_recovery_notice_hidden_without_erasing_diagnostics(self):
+        state = MarketState()
+        state.errors.update({
+            "futures_book_3": "TransportLagError: 连续10秒没有通过接收时效校验的消息",
+            "futures_book_1": "TimeoutError: handshake timed out",
+            "funding_stream": "ValueError: invalid response",
+        })
+        errors = dict(display_errors(state))
+        self.assertNotIn("futures_book_3", errors)
+        self.assertIn("futures_book_1", errors)
+        self.assertIn("funding_stream", errors)
+        self.assertIn("futures_book_3", state.errors)
 
     def test_time_weighted_average_normalizes_mixed_intervals(self):
         hour = 3_600_000

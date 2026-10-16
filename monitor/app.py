@@ -17,7 +17,8 @@ from .network.core import MarketNetworkWorker, monitor_loop_lag
 from .settings import (BASE_DIR, FILTER_CONFIG_PATH, FUNDING_CONFIG_PATH,
                        FUTURES_FUTURES_STATISTICS_CONFIG_PATH, RUNTIME_CONFIG_PATH,
                        STATISTICS_CONFIG_PATH, ConfigManager, FilterConfig,
-                       FundingConfig, RuntimeConfig, StatisticsConfig)
+                       FundingConfig, RuntimeConfig, StatisticsConfig,
+                       TRADFI_CONFIG_PATH, TRADFI_STATISTICS_CONFIG_PATH, TradFiConfig)
 from .terminal.pages import (poll_page_toggle, render, render_funding,
                              render_futures_futures)
 
@@ -45,6 +46,7 @@ def make_screen_job(
 ) -> Any:
     # Rendering must not iterate over dictionaries/deques being mutated by receivers.
     view = copy.copy(state)
+    view.quote_rejections = []
     for key, value in vars(state).items():
         if isinstance(value, dict):
             setattr(view, key, value.copy())
@@ -69,6 +71,8 @@ async def run() -> None:
     )
     runtime_manager = ConfigManager(RUNTIME_CONFIG_PATH, RuntimeConfig)
     funding_manager = ConfigManager(FUNDING_CONFIG_PATH, FundingConfig)
+    tradfi_manager = ConfigManager(TRADFI_CONFIG_PATH, TradFiConfig)
+    tradfi_statistics_manager = ConfigManager(TRADFI_STATISTICS_CONFIG_PATH, StatisticsConfig)
     data_root = resolve_path(runtime_manager.current.data_directory)
     diagnostic_store = BasisDiagnosticStore(data_root / "diagnostics")
     disk_writer = BackgroundWriter(runtime_manager.current.background_write_queue_size)
@@ -76,6 +80,7 @@ async def run() -> None:
     quantile_worker = QuantileWorker()
     engine = StatisticsEngine()
     futures_futures_engine = StatisticsEngine()
+    tradfi_engine = StatisticsEngine()
     state = MarketState()
     stop = asyncio.Event()
     state.set_pairing_config(filter_manager.current)
@@ -88,7 +93,7 @@ async def run() -> None:
         except NotImplementedError:
             pass
     network_worker = MarketNetworkWorker(
-        filter_manager, runtime_manager, data_root / "diagnostics"
+        filter_manager, runtime_manager, data_root / "diagnostics", tradfi=tradfi_manager
     )
     funding_history_worker = FundingHistoryWorker(funding_manager)
     network_worker.start()
@@ -109,10 +114,19 @@ async def run() -> None:
             await asyncio.to_thread(reload_configs, (
                 filter_manager, statistics_manager,
                 futures_futures_statistics_manager, runtime_manager, funding_manager,
+                tradfi_manager, tradfi_statistics_manager,
             ))
             filters = filter_manager.current
             network_worker.apply_latest(state)
             state.set_pairing_config(filters)
+            state.tradfi_config = tradfi_manager.current
+            tradfi_state = state.tradfi_view()
+            # Forget removed/disabled mappings; re-enabling starts a new observation.
+            tradfi_routes = tradfi_state.pair_routes(filters)
+            for key in list(tradfi_engine.pairs):
+                if key not in tradfi_routes:
+                    tradfi_engine.pairs.pop(key, None)
+                    state._tradfi_basis_cache.pop(key, None)
             liquid_routes = state.liquid_routes(filters)
             funding_symbols = {
                 liquid_routes[key].futures_symbol
@@ -121,16 +135,22 @@ async def run() -> None:
             }
             for route in state.liquid_futures_futures_routes(filters).values():
                 funding_symbols.update((route.usdt_symbol, route.usdc_symbol))
+            funding_symbols.update(route.futures_symbol for route in
+                                   tradfi_state.liquid_routes(filters).values())
             funding_history_worker.set_symbols(funding_symbols)
             funding_history_worker.apply_latest(state)
+            tradfi_state.funding_statistics = state.funding_statistics
             stats_config = statistics_manager.current
             futures_futures_stats_config = futures_futures_statistics_manager.current
+            tradfi_stats_config = tradfi_statistics_manager.current
+            await resize_statistics_windows(tradfi_engine, tradfi_stats_config.total_window_samples)
             await resize_statistics_windows(engine, stats_config.total_window_samples)
             await resize_statistics_windows(futures_futures_engine,
                 futures_futures_stats_config.total_window_samples
             )
             runtime = runtime_manager.current
             state.max_transport_lag_ms = runtime.max_transport_lag_ms
+            tradfi_state.max_transport_lag_ms = runtime.max_transport_lag_ms
             sample_interval = runtime.sample_interval_ms / 1000
             quote_max_age = runtime.quote_max_age_ms / 1000
             quote_tolerance = runtime.quote_match_tolerance_ms / 1000
@@ -170,6 +190,15 @@ async def run() -> None:
                 futures_futures_stats_config,
                 now_wall,
             )
+            tradfi_snapshots = tradfi_state.snapshots(
+                filters, quote_max_age, quote_tolerance, runtime.stale_seconds,
+            )
+            diagnostic_rows = diagnostic_store.process(
+                tradfi_state.drain_quote_rejections(), tradfi_snapshots, now_wall, write=False,
+            )
+            if diagnostic_rows:
+                disk_writer.submit(diagnostic_store.append_rows, diagnostic_rows, droppable=True)
+            tradfi_engine.update(tradfi_snapshots, sample_interval, tradfi_stats_config, now_wall)
             quantile_worker.collect()
             if now_mono - last_quantile >= runtime.quantile_refresh_seconds:
                 jobs = [
@@ -177,6 +206,8 @@ async def run() -> None:
                 ] + [
                     (stats, futures_futures_stats_config)
                     for stats in futures_futures_engine.pairs.values()
+                ] + [
+                    (stats, tradfi_stats_config) for stats in tradfi_engine.pairs.values()
                 ]
                 if quantile_worker.schedule(jobs):
                     last_quantile = now_mono
@@ -189,6 +220,7 @@ async def run() -> None:
                         statistics_manager,
                         futures_futures_statistics_manager,
                         runtime_manager, funding_manager,
+                        tradfi_manager, tradfi_statistics_manager,
                     )
                     if manager.error
                 ]
@@ -196,7 +228,12 @@ async def run() -> None:
                     disk_writer.last_error, screen_writer.last_error,
                     f"写盘任务丢弃 {disk_writer.dropped_records}" if disk_writer.dropped_records else "",
                 )))
-                if current_page == "spot_futures":
+                page_state = state
+                if current_page == "tradfi":
+                    renderer, page_engine, page_config = render, tradfi_engine, tradfi_stats_config
+                    tradfi_state.errors = state.errors
+                    page_state = tradfi_state
+                elif current_page == "spot_futures":
                     renderer, page_engine, page_config = render, engine, stats_config
                 elif current_page == "futures_futures":
                     renderer, page_engine, page_config = (
@@ -207,7 +244,7 @@ async def run() -> None:
                 else:
                     renderer, page_engine, page_config = render_funding, engine, stats_config
                 screen_writer.publish(make_screen_job(
-                    renderer, state, page_engine,
+                    renderer, page_state, page_engine,
                     filters, page_config, funding_manager.current,
                     runtime, started_mono, errors,
                 ))

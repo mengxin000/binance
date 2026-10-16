@@ -5,6 +5,7 @@ import copy
 import json
 import logging
 import queue
+import re
 import threading
 import time
 from collections import deque
@@ -23,6 +24,7 @@ from ..models import BookQuote, FundingQuote, MarketState, TransportLagError
 from ..settings import (FUNDING_STREAM, FUTURES_BOOK_BASE, FUTURES_TICKER_STREAM,
                         SPOT_BOOK_BASE, SPOT_TICKER_STREAM)
 from ..settings import ConfigManager, RuntimeConfig
+from .clock_sync import ServerClock
 
 async def consume_tickers(
     url: str, market: str, state: MarketState, stop: asyncio.Event,
@@ -256,15 +258,33 @@ def extract_combined_stream_symbol(payload: bytes, allowed: frozenset[str]) -> s
     return next(iter(allowed)) if len(allowed) == 1 else None
 
 
+_EVENT_TIME_FIELD = re.compile(rb'"E"\s*:\s*([0-9]{1,16})(?=\s*[,}])')
+
+
+def extract_event_time_ms(payload: bytes) -> int | None:
+    """Read the numeric E in Binance BBO payloads without decoding the full JSON."""
+    match = _EVENT_TIME_FIELD.search(payload)
+    if match is None:
+        return None
+    value = int(match.group(1))
+    return value if value > 0 else None
+
+
 class LatestQuotePipeline:
     """One unparsed latest slot per market+symbol and one coalescing parser thread."""
 
-    def __init__(self, runtime_manager: Any, diagnostics: NetworkDiagnostics) -> None:
+    def __init__(self, runtime_manager: Any, diagnostics: NetworkDiagnostics,
+                 clock: ServerClock | None = None) -> None:
         self.runtime_manager, self.diagnostics = runtime_manager, diagnostics
+        self.clock = clock
+        self.clock_unavailable = 0
+        self.stage_timings: dict[str, dict[str, Any]] = {}
+        self._last_ingress_log: dict[str, float] = {}
         self.lock = threading.Lock()
         self.latest_raw: dict[tuple[str, str], LatestRawQuote] = {}
         self.dirty: set[tuple[str, str]] = set()
         self.updates: dict[tuple[str, str], BookQuote] = {}
+        self.published_at: dict[tuple[str, str], tuple[str, float]] = {}
         self.faults: dict[object, str] = {}
         self.counters: dict[str, PipelineCounter] = {}
         self.sequence = 0
@@ -284,14 +304,52 @@ class LatestQuotePipeline:
         self, market: str, connection_key: str, connection_token: object,
         allowed: frozenset[str], payload: bytes, received_at: float,
         received_wall_ms: float,
-    ) -> None:
+    ) -> bool | None:
+        """True: stored; False: discarded; None: cannot evaluate clock yet."""
         symbol = extract_combined_stream_symbol(payload, allowed)
+        status: bool | None = True
+        event_time = extract_event_time_ms(payload) if market == "futures" else None
+        estimate = self.clock.current() if self.clock is not None else None
+        lag = None
+        reason = ""
+        if market == "futures":
+            if event_time is None:
+                status, reason = False, "missing_event_time"
+            elif self.clock is not None and estimate is None:
+                status, reason = None, "clock_unavailable"
+            else:
+                lag = (estimate.event_lag(received_at, event_time) if estimate else
+                       received_wall_ms - event_time)
+                uncertainty = estimate.rtt_ms / 2 if estimate else 0.0
+                if lag < -uncertainty - 100:
+                    status, reason = None, "clock_inconsistent"
+                elif lag > self.runtime_manager.current.max_transport_lag_ms:
+                    status, reason = False, "transport_lag"
         with self.lock:
             counter = self.counters.setdefault(connection_key, PipelineCounter())
             counter.received += 1
             if symbol is None:
                 counter.invalid += 1
-                return
+                return False
+            if status is not True:
+                if reason == "transport_lag":
+                    counter.transport_lag += 1
+                elif status is None:
+                    self.clock_unavailable += 1
+                else:
+                    counter.invalid += 1
+                # Limit log production on the ingress hot path, not message drops.
+                if received_at - self._last_ingress_log.get(connection_key, float('-inf')) >= 1:
+                    self._last_ingress_log[connection_key] = received_at
+                    self.diagnostics.emit(
+                        "ingress_drop", connection=connection_key, symbol=symbol,
+                        reason=reason, corrected_event_lag_ms=lag,
+                        raw_event_lag_ms=received_wall_ms-event_time if event_time else None,
+                        received_wall_ms=received_wall_ms, exchange_event_time_ms=event_time,
+                        clock_offset_ms=estimate.offset_ms if estimate else None,
+                        clock_uncertainty_ms=estimate.rtt_ms/2 if estimate else None,
+                    )
+                return status
             key = (market, symbol)
             if key in self.dirty:
                 counter.overwritten += 1
@@ -300,6 +358,7 @@ class LatestQuotePipeline:
                 RawMessage(received_at, received_wall_ms, payload),
             )
             self.dirty.add(key)
+        return True
 
     def _take_dirty(self) -> list[LatestRawQuote]:
         with self.lock:
@@ -327,6 +386,7 @@ class LatestQuotePipeline:
                     self._increment(raw.connection_key, "expired")
                     continue
                 try:
+                    parse_started = time.monotonic()
                     payload = json.loads(raw.message.payload)
                     row = payload.get("data") if isinstance(payload, dict) else None
                     if not isinstance(row, dict):
@@ -350,15 +410,36 @@ class LatestQuotePipeline:
                     )
                     lag = None
                     if raw.market == "futures" and exchange_ms is not None:
-                        lag = max(0.0, raw.message.received_wall_ms - exchange_ms)
+                        raw_lag = raw.message.received_wall_ms - exchange_ms
+                        estimate = self.clock.current() if self.clock is not None else None
+                        if self.clock is not None and estimate is None:
+                            # Do not label clock uncertainty as transport failure.
+                            with self.lock:
+                                self.clock_unavailable += 1
+                            continue
+                        corrected_lag = (estimate.event_lag(raw.message.received_at, exchange_ms)
+                                         if estimate is not None else raw_lag)
+                        uncertainty = estimate.rtt_ms / 2 if estimate else 0.0
+                        with self.lock:
+                            self.stage_timings[raw.connection_key] = {
+                                "symbol": symbol, "received_wall_ms": raw.message.received_wall_ms,
+                                "exchange_event_time_ms": exchange_ms,
+                                "raw_event_lag_ms": round(raw_lag, 2),
+                                "corrected_event_lag_ms": round(corrected_lag, 2),
+                                "clock_offset_ms": estimate.offset_ms if estimate else None,
+                                "clock_uncertainty_ms": uncertainty,
+                                "raw_wait_ms": round(age_ms, 2),
+                                "parse_ms": round((time.monotonic() - parse_started) * 1000, 3),
+                            }
+                        if corrected_lag < -uncertainty - 100:
+                            # REST and event clocks are inconsistent; fail closed,
+                            # without repeatedly reconnecting a healthy transport.
+                            with self.lock:
+                                self.clock_unavailable += 1
+                            continue
+                        lag = max(0.0, corrected_lag)
                         if lag > self.runtime_manager.current.max_transport_lag_ms:
                             self._increment(raw.connection_key, "transport_lag")
-                            detail = (
-                                f"永续事件延迟 {lag:.0f}ms，上限 "
-                                f"{self.runtime_manager.current.max_transport_lag_ms}ms"
-                            )
-                            with self.lock:
-                                self.faults[raw.connection_token] = detail
                             lag_row = cycle_lags.setdefault(raw.connection_key, {
                                 "affected_symbols": 0, "max_lag_ms": 0.0,
                                 "max_lag_symbol": symbol, "max_raw_age_ms": 0.0,
@@ -370,6 +451,12 @@ class LatestQuotePipeline:
                             if lag > lag_row["max_lag_ms"]:
                                 lag_row["max_lag_ms"] = round(lag, 1)
                                 lag_row["max_lag_symbol"] = symbol
+                                lag_row["received_wall_ms"] = raw.message.received_wall_ms
+                                lag_row["exchange_event_time_ms"] = exchange_ms
+                                lag_row["raw_age_at_parse_ms"] = round(age_ms, 1)
+                                lag_row["raw_event_lag_ms"] = round(raw_lag, 1)
+                                lag_row["clock_offset_ms"] = estimate.offset_ms if estimate else None
+                                lag_row["clock_uncertainty_ms"] = uncertainty
                             continue
                     self.sequence += 1
                     quote = BookQuote(
@@ -385,6 +472,7 @@ class LatestQuotePipeline:
                             counter.overwritten += 1
                             continue
                         self.updates[(raw.market, symbol)] = quote
+                        self.published_at[(raw.market, symbol)] = (raw.connection_key, time.monotonic())
                     self._increment(raw.connection_key, "parsed")
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                     self._increment(raw.connection_key, "invalid")
@@ -401,13 +489,19 @@ class LatestQuotePipeline:
                 self.diagnostics.emit(
                     "slow_parse_cycle", duration_ms=round(elapsed_ms, 1), symbols=len(rows)
                 )
-            if time.monotonic() - last_summary >= 60:
+            if time.monotonic() - last_summary >= 10:
                 self.diagnostics.emit("pipeline_summary", **self.metrics())
                 last_summary = time.monotonic()
 
     def apply_latest(self, state: MarketState) -> None:
         with self.lock:
             updates, self.updates = self.updates, {}
+            published, self.published_at = self.published_at, {}
+            now = time.monotonic()
+            for key, (connection, published_mono) in published.items():
+                stages = self.stage_timings.setdefault(connection, {})
+                stages["publish_to_coordinator_ms"] = round((now - published_mono) * 1000, 2)
+                stages["receive_to_coordinator_ms"] = round((now - updates[key].received_at) * 1000, 2)
         for (market, symbol), quote in updates.items():
             destination = state.spot_books if market == "spot" else state.futures_books
             destination[symbol] = quote
@@ -419,11 +513,29 @@ class LatestQuotePipeline:
         with self.lock:
             return self.faults.pop(token, None)
 
+    def retire_connection(self, token: object) -> None:
+        """Invalidate pending work for a closed socket; keep other sockets intact."""
+        with self.lock:
+            self.faults.pop(token, None)
+            for key, raw in list(self.latest_raw.items()):
+                if raw.connection_token is token:
+                    self.latest_raw.pop(key, None)
+                    self.dirty.discard(key)
+
     def metrics(self) -> dict[str, Any]:
         with self.lock:
             pending = len(self.dirty)
             counters = [copy.copy(counter) for counter in self.counters.values()]
+            stages = {key: value.copy() for key, value in self.stage_timings.items()}
+            clock_unavailable = self.clock_unavailable
+        estimate = self.clock.current() if self.clock is not None else None
         return {
+            "stage_timings": stages,
+            "clock_unavailable": clock_unavailable,
+            "clock_ready": estimate is not None,
+            "clock_offset_ms": estimate.offset_ms if estimate else None,
+            "clock_rtt_ms": estimate.rtt_ms if estimate else None,
+            "clock_error": self.clock.error if self.clock is not None else "",
             "pending_symbols": pending,
             "received": sum(c.received for c in counters),
             "overwritten": sum(c.overwritten for c in counters),
@@ -463,6 +575,7 @@ class LatestBBOConnection(ClientConnection):
         self.connection_token = object()
         self.fragments: list[bytes] = []
         self.last_message_at = time.monotonic()
+        self.unhealthy_since: float | None = None
         self.complete_messages = 0
 
     def data_received(self, data: bytes) -> None:
@@ -495,22 +608,40 @@ class LatestBBOConnection(ClientConnection):
                         self.last_message_at, received_wall_ms, payload,
                     ))
                 else:
-                    self.pipeline.put(
+                    accepted = self.pipeline.put(
                         self.market, self.connection_key, self.connection_token,
                         self.allowed_symbols, payload, self.last_message_at,
                         received_wall_ms,
                     )
+                    if accepted is False:
+                        if self.unhealthy_since is None:
+                            self.unhealthy_since = self.last_message_at
+                    else:
+                        # A fresh message or unavailable clock ends the stale run.
+                        self.unhealthy_since = None
             return
         super().process_event(event)
 
     async def watch_connection(self) -> None:
         while not self.connection_lost_waiter.done():
             try:
-                await asyncio.wait_for(asyncio.shield(self.connection_lost_waiter), 1)
+                await asyncio.wait_for(asyncio.shield(self.connection_lost_waiter), 0.1)
             except asyncio.TimeoutError:
                 if self.pipeline is not None:
-                    fault = self.pipeline.pop_fault(self.connection_token)
-                    if fault:
+                    if self.pipeline.clock is not None and self.pipeline.clock.current() is None:
+                        self.unhealthy_since = None
+                    timeout = self.pipeline.runtime_manager.current.bbo_invalid_reconnect_seconds
+                    invalid_seconds = (time.monotonic() - self.unhealthy_since
+                                       if self.unhealthy_since is not None else 0)
+                    if invalid_seconds >= timeout:
+                        fault = f"连续 {invalid_seconds:.1f}秒没有通过接收时效校验的消息"
+                        self.pipeline.diagnostics.emit(
+                            "connection_lag_abort", connection=self.connection_key,
+                            error=fault, invalid_seconds=invalid_seconds,
+                            reconnect_after_seconds=timeout,
+                        )
+                        # Don't perform a graceful close behind delayed TCP data.
+                        self.transport.abort()
                         raise TransportLagError(fault)
                 if time.monotonic() - self.last_message_at > 45:
                     raise TimeoutError("BBO 45秒未收到完整消息")
@@ -619,6 +750,8 @@ async def consume_book_chunk(
                     for worker in workers:
                         worker.cancel()
                     await asyncio.gather(*workers, return_exceptions=True)
+                    if pipeline is not None and direct:
+                        pipeline.retire_connection(websocket.connection_token)
                     state.set_book_chunk_connected(market, connection_key, False)
                     if time.monotonic() - connected_at >= 30:
                         delay = 1.0
@@ -627,16 +760,21 @@ async def consume_book_chunk(
         except Exception as exc:
             state.set_book_chunk_connected(market, connection_key, False)
             state.errors[error_key] = f"{type(exc).__name__}: {exc}"
+            # Stale data recovery is not a failed connection attempt. Bound its
+            # retry rate, but never inherit a previous 30-second failure backoff.
+            lag_failure = isinstance(exc, TransportLagError)
+            retry_delay = 1.0 if lag_failure else delay
             if pipeline is not None:
                 pipeline.diagnostics.emit(
                     "connection_retry", connection=error_key,
-                    error=f"{type(exc).__name__}: {exc}", delay_seconds=delay,
+                    error=f"{type(exc).__name__}: {exc}", delay_seconds=retry_delay,
+                    retry_reason="transport_lag" if lag_failure else "connection_failure",
                 )
             try:
-                await asyncio.wait_for(stop.wait(), timeout=delay)
+                await asyncio.wait_for(stop.wait(), timeout=retry_delay)
             except asyncio.TimeoutError:
                 pass
-            delay = min(delay * 2, 30)
+            delay = 1.0 if lag_failure else min(delay * 2, 30)
         finally:
             state.set_book_chunk_connected(market, connection_key, False)
 
@@ -855,8 +993,10 @@ class MarketNetworkWorker:
     Mutable market dictionaries never cross thread boundaries without copying.
     """
 
-    def __init__(self, filters: Any, runtime: Any, diagnostics_dir: Path | None = None) -> None:
+    def __init__(self, filters: Any, runtime: Any, diagnostics_dir: Path | None = None,
+                 tradfi: Any = None) -> None:
         self.filters, self.runtime = filters, runtime
+        self.tradfi = tradfi
         self.diagnostics_dir = diagnostics_dir
         self._lock = threading.Lock()
         self._snapshot: dict[str, Any] = {}
@@ -880,7 +1020,9 @@ class MarketNetworkWorker:
             self.diagnostics_dir / "network_pipeline.jsonl" if self.diagnostics_dir else None,
             self.runtime.current.network_log_max_bytes,
         )
-        pipeline = LatestQuotePipeline(self.runtime, diagnostics)
+        clock = ServerClock(self.runtime, diagnostics)
+        clock.start()
+        pipeline = LatestQuotePipeline(self.runtime, diagnostics, clock=clock)
         spot_ingress = BBOIngressWorker("spot", self.runtime, pipeline, diagnostics)
         futures_ingress = BBOIngressWorker("futures", self.runtime, pipeline, diagnostics)
         spot_ingress.start()
@@ -916,6 +1058,8 @@ class MarketNetworkWorker:
                 if pipeline.error:
                     raise RuntimeError(f"BBO解析线程退出: {pipeline.error}")
                 state.set_pairing_config(self.filters.current)
+                if self.tradfi is not None:
+                    state.tradfi_config = self.tradfi.current
                 state.max_transport_lag_ms = self.runtime.current.max_transport_lag_ms
                 spot_ingress.set_symbols(
                     state.book_symbols("spot", self.filters.current)
@@ -935,6 +1079,10 @@ class MarketNetworkWorker:
                 pipeline.apply_latest(state)
                 if diagnostics.error:
                     state.errors["network_log"] = diagnostics.error
+                state.errors["clock_sync"] = (
+                    (clock.error or "尚未完成服务器对时") + "；暂停未校时永续样本，不触发延迟重连"
+                    if clock.current() is None else ""
+                )
                 snapshot = {name: getattr(state, name).copy() for name in (
                     "spot_volumes", "futures_volumes", "spot_books", "futures_books",
                     "funding_quotes",
@@ -965,6 +1113,7 @@ class MarketNetworkWorker:
                 asyncio.to_thread(futures_ingress.close),
             )
             await asyncio.to_thread(pipeline.close)
+            await asyncio.to_thread(clock.close)
             diagnostics.emit(
                 "pipeline_stop", **pipeline.metrics(),
                 ticker_loop_peak_ms=round(state.max_loop_lag_ms, 1),

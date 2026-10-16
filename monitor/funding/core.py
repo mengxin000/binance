@@ -219,7 +219,8 @@ class FundingHistoryWorker:
                     symbols = self._desired_symbols
                     last_refresh = self._last_refresh.copy()
                 due = [symbol for symbol in symbols
-                       if now - last_refresh.get(symbol, 0.0) >= config.history_refresh_seconds]
+                       if symbol not in last_refresh
+                       or now - last_refresh[symbol] >= config.history_refresh_seconds]
                 for symbol in due:
                     if self._stop.is_set():
                         break

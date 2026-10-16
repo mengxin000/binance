@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import ssl
 import time
 from dataclasses import dataclass
 from typing import Any
 
-from .settings import BINANCE_WEBSOCKET_OPTIONS, FilterConfig
+from .settings import BINANCE_WEBSOCKET_OPTIONS, FilterConfig, TradFiConfig
 
 # 币安接口数据类
 @dataclass(slots=True)
@@ -124,6 +125,9 @@ class FuturesFuturesRoute:
 # 显示状态栏
 class MarketState:
     def __init__(self) -> None:
+        self.market_type = "spot_futures"
+        self.tradfi_config = TradFiConfig()
+        self._tradfi_basis_cache: dict[str, tuple[Any, ...]] = {}
         self.quote_assets: frozenset[str] = frozenset({"USDT"})
         self.cross_quote_pairings: tuple[tuple[str, str], ...] = ()
         self.spot_volumes: dict[str, VolumeTicker] = {}
@@ -236,6 +240,8 @@ class MarketState:
         return None
 
     def pair_routes(self, filters: FilterConfig) -> dict[str, PairRoute]:
+        if self.market_type == "tradfi":
+            return self.tradfi_routes(filters)
         spot_by_asset: dict[tuple[str, str], str] = {}
         futures_by_asset: dict[tuple[str, str], str] = {}
         # 使用 list() 避免遍历期间 dict 被并发修改导致 RuntimeError
@@ -274,6 +280,36 @@ class MarketState:
                     spot_quote, futures_quote, conversion_symbol, inverted,
                 )
         return routes
+
+    def tradfi_routes(self, filters: FilterConfig) -> dict[str, PairRoute]:
+        routes = {}
+        if not self.tradfi_config.enabled:
+            return routes
+        pairings = [(asset, asset) for asset in filters.quote_assets]
+        pairings.extend(tuple(pair) for pair in filters.cross_quote_pairings)
+        for spot_base, futures_base in self.tradfi_config.mappings.items():
+            for spot_quote, futures_quote in pairings:
+                spot = spot_base + spot_quote
+                futures = futures_base + futures_quote
+                if spot not in self.spot_volumes or futures not in self.futures_volumes:
+                    continue
+                conversion = self._conversion_for(futures_quote, spot_quote)
+                if conversion is None:
+                    continue
+                key = f"{spot}__{futures}"
+                routes[key] = PairRoute(
+                    key, futures_base, spot, futures,
+                    spot_quote, futures_quote, *conversion,
+                )
+        return routes
+
+    def tradfi_view(self) -> MarketState:
+        """Reuse spot/perpetual logic against mapped routes, without copying BBOs."""
+        view = copy.copy(self)
+        view.market_type = "tradfi"
+        view._spot_futures_basis_cache = self._tradfi_basis_cache
+        view.quote_rejections = []
+        return view
 
     def futures_futures_routes(
         self, filters: FilterConfig
@@ -393,6 +429,7 @@ class MarketState:
 
     def book_symbols(self, market: str, filters: FilterConfig) -> set[str]:
         routes = self.liquid_routes(filters)
+        routes.update(self.tradfi_view().liquid_routes(filters))
         futures_futures = self.liquid_futures_futures_routes(filters)
         self.active_routes = routes
         if market == "futures":
@@ -533,8 +570,8 @@ class MarketState:
         tolerance_seconds: float = 0.2,
         stream_stale_seconds: float | None = None,
     ) -> list[PairSnapshot]:
-        if not self.streams_healthy(stream_stale_seconds or max_age_seconds):
-            return []
+        # Connection flags are aggregate UI health, not per-route eligibility.
+        # Each route below must independently pass age, skew and transport checks.
         now = time.monotonic()
         result: list[PairSnapshot] = []
         routes = self.liquid_routes(filters)
@@ -577,7 +614,7 @@ class MarketState:
             )
             if not valid:
                 self._record_quote_rejection(
-                    "spot_futures", key, basis_bps, reason,
+                    self.market_type, key, basis_bps, reason,
                     ages_ms, skew_ms, quotes,
                 )
                 continue
@@ -585,7 +622,7 @@ class MarketState:
                 key, spot_mid, futures_mid,
                 basis_bps,
                 route.spot_symbol, route.futures_symbol, rate,
-                "spot_futures", skew_ms, ages_ms,
+                self.market_type, skew_ms, ages_ms,
                 tuple(quote.exchange_event_time_ms for quote in quotes),
             ))
         return result
@@ -595,8 +632,7 @@ class MarketState:
         tolerance_seconds: float = 0.2,
         stream_stale_seconds: float | None = None,
     ) -> list[PairSnapshot]:
-        if not self.streams_healthy(stream_stale_seconds or max_age_seconds):
-            return []
+        # An unrelated reconnect must not suspend healthy routes.
         now = time.monotonic()
         result: list[PairSnapshot] = []
         for route in self.liquid_futures_futures_routes(filters).values():

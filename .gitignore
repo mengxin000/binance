@@ -8,3 +8,5 @@ test_network.py
 test_funding.py
 test_main.py
 uv.lock
+tools
+docs

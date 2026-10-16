@@ -56,6 +56,11 @@ def table_row(values: list[str], widths: list[int], aligns: list[str]) -> str:
 
 def pipeline_status(state: MarketState) -> str:
     metrics = state.pipeline_metrics
+    clock_text = ""
+    if "clock_ready" in metrics:
+        clock_text = (f" | 对时offset: {metrics['clock_offset_ms']:+.1f}ms / "
+                      f"RTT {metrics['clock_rtt_ms']:.1f}ms"
+                      if metrics["clock_ready"] else " | 对时未就绪")
     if metrics:
         pipeline = (
             f"BBO最新槽待解析: {metrics.get('pending_symbols', 0)} | "
@@ -79,7 +84,7 @@ def pipeline_status(state: MarketState) -> str:
         f"{getattr(state, 'futures_network_max_loop_lag_ms', 0):.1f}ms "
         f"({getattr(state, 'futures_network_connections', 0)}连接) | "
         f"ticker网络: {getattr(state, 'ticker_loop_lag_ms', 0):.1f}/"
-        f"{getattr(state, 'ticker_max_loop_lag_ms', 0):.1f}ms"
+        f"{getattr(state, 'ticker_max_loop_lag_ms', 0):.1f}ms" + clock_text
     )
 
 
@@ -92,14 +97,21 @@ def funding_snapshot(
     if quote is None:
         return "--", average_text, None, None, None, history
     age = max(0.0, time.monotonic() - quote.received_at)
-    if age > config.current_max_age_seconds:
-        return "--", average_text, None, None, age, history
     current_text = f"{quote.rate * 10_000:+.2f}bp"
     if history is None:
         return current_text, average_text, None, None, age, None
     current = history.current_bps_8h(quote)
     percentile = history.percentile(current)
     return current_text, average_text, current, percentile, age, history
+
+
+def display_errors(state: MarketState) -> list[tuple[str, str]]:
+    """Hide expected BBO delay recovery notices; retain other terminal errors."""
+    return [(key, message) for key, message in state.errors.items()
+            if message and not (
+                key.startswith(("spot_book", "futures_book"))
+                and message.startswith("TransportLagError:")
+            )]
 
 def render(
     state: MarketState,
@@ -117,7 +129,9 @@ def render(
         if stats.symbol in state.eligible_symbols(filters)
     ]
     lines = [
-        "Binance 现货－USDT/USDC-M 永续基差波动筛选  [按 K 切换页面]",
+        ("Binance TradFi 映射现货－永续基差波动筛选  [按 K 切换页面]"
+         if state.market_type == "tradfi" else
+         "Binance 现货－USDT/USDC-M 永续基差波动筛选  [按 K 切换页面]"),
         f"成交额流: 现货 {'在线' if state.ticker_connected['spot'] else '重连中'} / "
         f"永续 {'在线' if state.ticker_connected['futures'] else '重连中'} | "
         f"盘口流: 现货 {'在线' if state.book_connected['spot'] else '重连中'} / "
@@ -139,7 +153,19 @@ def render(
     ]
     for message in config_errors:
         lines.append(f"配置错误: {message}")
-    for key, message in state.errors.items():
+    if state.market_type == "tradfi":
+        lines.append(f"映射表: {'开启' if state.tradfi_config.enabled else '关闭'} | "
+                     f"配置映射: {len(state.tradfi_config.mappings)} | 仅支持已确认价格单位一致的产品")
+        for spot_base, futures_base in state.tradfi_config.mappings.items():
+            if not state.tradfi_config.enabled:
+                continue
+            matched = [route for route in state.pair_routes(filters).values()
+                       if route.spot_symbol == spot_base + route.spot_quote
+                       and route.futures_symbol == futures_base + route.futures_quote]
+            if not matched:
+                lines.append(f"映射待就绪: {spot_base}/{futures_base} "
+                             "— 检查报价币种、双方 ticker 是否存在及汇率市场")
+    for key, message in display_errors(state):
         if message:
             lines.append(f"{key} 错误: {message}")
     quantile_name = (
@@ -256,7 +282,7 @@ def render_futures_futures(
     ]
     for message in config_errors:
         lines.append(f"配置错误: {message}")
-    for key, message in state.errors.items():
+    for key, message in display_errors(state):
         if message:
             lines.append(f"{key} 错误: {message}")
     quantile_name = (
@@ -325,7 +351,8 @@ def render_futures_futures(
             lines.append(table_row([
                 str(index), state.futures_futures_label(stats.symbol, filters),
                 format_quote_volume(usdt_volume), format_quote_volume(usdc_volume),
-                f"{stats.current_spot_mid:.8g}", f"{stats.current_futures_mid:.8g}",
+                f"{stats.current_spot_mid:.8g}",
+                f"{stats.current_futures_mid:.8g}",
                 f"{stats.mean_basis_bps:+.2f}bp",
                 f"{stats.mean_basis_bps - stats_config.sigma_multiplier * sigma:+.2f}～{stats.mean_basis_bps + stats_config.sigma_multiplier * sigma:+.2f}bp",
                 short_text, long_text, runtime_text,
@@ -391,7 +418,7 @@ def render_funding(
     ]
     for message in config_errors:
         lines.append(f"配置错误: {message}")
-    for key, message in state.errors.items():
+    for key, message in display_errors(state):
         if message:
             lines.append(f"{key} 错误: {message}")
     if state.funding_history_errors:
@@ -466,6 +493,6 @@ def poll_page_toggle(current_page: str) -> str:
 
     while msvcrt.kbhit():
         if msvcrt.getwch().lower() == "k":
-            pages = ("spot_futures", "futures_futures", "funding")
+            pages = ("spot_futures", "futures_futures", "funding", "tradfi")
             current_page = pages[(pages.index(current_page) + 1) % len(pages)]
     return current_page

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
@@ -31,6 +31,24 @@ STATISTICS_CONFIG_PATH = BASE_DIR / "config" / "basis_spot_futures.json"
 FUTURES_FUTURES_STATISTICS_CONFIG_PATH = BASE_DIR / "config" / "basis_futures_futures.json"
 RUNTIME_CONFIG_PATH = BASE_DIR / "config" / "runtime.json"
 FUNDING_CONFIG_PATH = CONFIG_DIR / "funding.json"
+TRADFI_CONFIG_PATH = CONFIG_DIR / "tradfi.json"
+TRADFI_STATISTICS_CONFIG_PATH = CONFIG_DIR / "basis_tradfi.json"
+
+
+@dataclass(frozen=True, slots=True)
+class TradFiConfig:
+    enabled: bool = True
+    mappings: dict[str, str] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("enabled 必须是布尔值")
+        if not isinstance(self.mappings, dict):
+            raise ValueError('mappings 必须是对象，例如 {"QQQB": "QQQ"}')
+        for spot_base, futures_base in self.mappings.items():
+            for name, value in (("现货 base", spot_base), ("永续 base", futures_base)):
+                if not isinstance(value, str) or not value.isascii() or not value.isalnum() or value != value.upper():
+                    raise ValueError(f"{name} 必须是非空大写字母/数字")
 
 
 # 配置文件类
@@ -112,12 +130,16 @@ class StatisticsConfig:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeConfig:
+    clock_sync_interval_seconds: float = 60.0
+    clock_sync_max_age_seconds: float = 180.0
+    clock_sync_max_rtt_ms: float = 1000.0
     sample_interval_ms: int = 200
     display_refresh_seconds: float = 1.0
     stale_seconds: float = 2.0
     quote_max_age_ms: int = 1000
     quote_match_tolerance_ms: int = 200
-    max_transport_lag_ms: int = 2000
+    max_transport_lag_ms: int = 3000
+    bbo_invalid_reconnect_seconds: float = 10.0
     persist_interval_seconds: float = 60.0
     quantile_refresh_seconds: float = 15.0
     background_write_queue_size: int = 10_000
@@ -127,6 +149,10 @@ class RuntimeConfig:
     data_directory: str = "data"
 
     def validate(self) -> None:
+        if not 10 <= self.clock_sync_interval_seconds <= self.clock_sync_max_age_seconds <= 3600:
+            raise ValueError("对时周期需至少10秒，且不超过对时有效期（最多3600秒）")
+        if not 1 <= self.clock_sync_max_rtt_ms <= 2000:
+            raise ValueError("clock_sync_max_rtt_ms 必须在1到2000之间")
         if not isinstance(self.sample_interval_ms, int) or self.sample_interval_ms < 50:
             raise ValueError("sample_interval_ms 必须是至少 50 的整数")
         if (
@@ -153,6 +179,8 @@ class RuntimeConfig:
             raise ValueError("quote_match_tolerance_ms 必须是 0 到 quote_max_age_ms 之间的整数")
         if not isinstance(self.max_transport_lag_ms, int) or self.max_transport_lag_ms < 500:
             raise ValueError("max_transport_lag_ms 必须是至少 500 的整数")
+        if not 1 <= self.bbo_invalid_reconnect_seconds <= 300:
+            raise ValueError("bbo_invalid_reconnect_seconds 必须在1到300秒之间")
         if self.persist_interval_seconds <= 0 or not self.data_directory.strip():
             raise ValueError("持久化间隔必须大于 0，数据目录不能为空")
         if self.quantile_refresh_seconds <= 0:

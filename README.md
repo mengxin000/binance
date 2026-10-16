@@ -2,15 +2,35 @@
 
 从 Binance 现货与USDT/USDC本位永续全市场中筛选基差波动机会，并独立筛选适合研究长期资金费率套利的交易对。程序只统计，不需要 API Key、不下单，也不估算账户级净收益。
 
-直接在 Python IDE 中运行 `main.py`。需要长期运行时启动 `guardian.py`；主程序异常退出后，守护程序会等待3秒并自动重启，按 Ctrl+C 可同时停止。运行期间按 `K` 循环切换“现货－永续基差”“USDT永续－USDC永续基差”和“资金费率套利”三个页面。
+直接在 Python IDE 中运行 `main.py`。需要长期运行时启动 `guardian.py`；主程序异常退出后，守护程序会等待3秒并自动重启，按 Ctrl+C 可同时停止。运行期间按 `K` 循环切换“现货－永续基差”“USDT永续－USDC永续基差”“资金费率套利”和“TradFi”四个页面。
+
+## TradFi 映射页面
+
+`config/tradfi.json` 热加载显式映射，使用 `"mappings": {"QQQB": "QQQ"}`，键是现货 base，值是永续 base。新增键值对即可增加映射，删除键值对即可停止该映射；顶层 `enabled` 控制整页路线启用。页面显示原始 symbol，例如 `QQQBUSDT/QQQUSDT`。仅配置经过人工确认、价格单位一致的产品，不按包含关系或价格相近自动匹配。
+
+成交额、价格、报价币种及跨币种路线复用 `config/market.json`；窗口、σ 和机会阈值独立使用 `config/basis_tradfi.json`，同样热加载。行情订阅与其他页面取并集，均值、标准差、分位数、行情质量检查和排名复用现货－永续代码，但统计独立。更改映射会自动调整订阅；删除或禁用路线后清除对应内存统计，重新启用重新积累，不写入交易对统计文件。
+
+路由只有在双方 ticker 中发现实际交易对（跨报价还需汇率市场）后才生成；缺失时页面显示“映射待就绪”。这是复用现有 ticker 发现机制，并非单独的产品上市/交易状态验证。即使路线可配对，仍需满足成交额、现货价格及 σ 门槛才进入榜单。不使用 1% 价差硬过滤，以免截断真实波动样本。
 
 ## 数据口径
+
+行情质量按路线独立检查，不再因其他 BBO 分组或 ticker 重连而暂停全部采样；成交额仍使用最新缓存的 ticker，盘口腿仍须通过年龄、时差与永续事件延迟检查。表格恢复保留最后一次有效采样的价格、价差和当前位置，断流不改成 `--`；这不代表旧报价会继续进入统计。
+
+永续完整消息刚进入接收回调时，轻量提取 `E` 并检查校正事件延迟。超过 `max_transport_lag_ms`（默认3000ms）立即丢弃，不做完整JSON解析、不进入最新值槽、不更新旧报价的接收时间。单条超限不重连；连续 `bbo_invalid_reconnect_seconds`（默认10秒）没有通过接收时效校验的消息，才中止该连接并等待1秒后重试。一条合格新消息会清除连续失效计时；对时未就绪不按延迟故障重连。普通连接失败仍采用最高30秒的指数退避。
+
+服务器对时使用公共 `GET https://fapi.binance.com/fapi/v1/time`，独立线程启动即请求，以后每 `clock_sync_interval_seconds`（默认60秒）采集3次，选RTT最小的合格样本。offset = 服务器时间 - 本机请求起止墙钟中点；计算消息延迟时通过单调时钟锚点推算接收时的服务器时间，不修改系统时间，也不受之后本机墙钟跳变直接影响。RTT上限 `clock_sync_max_rtt_ms` 默认1000ms；估计有效期 `clock_sync_max_age_seconds` 默认180秒。对时失败10秒后重试；有效旧估计可继续使用，无有效估计则暂停永续样本，不用未经校正的时间差触发重连。REST与事件时间不一致（负延迟超过RTT/2+100ms）也拒绝样本。
+
+`data/diagnostics/network_pipeline.jsonl` 每10秒记录 `pipeline_summary.stage_timings`：`raw_event_lag_ms` 为未经校正的事件时间差，`corrected_event_lag_ms` 为校正后事件到完整消息回调的时间差，`raw_wait_ms` 为本地原始槽等待，`parse_ms` 为本地解析与校验耗时，`publish_to_coordinator_ms` 为发布后等待协调线程读取的耗时，`receive_to_coordinator_ms` 为完整消息回调到协调线程的总耗时。各字段为该连接近期观测，读取阶段字段可能对应另一条消息。`clock_sync` 记录offset与RTT。校正后的事件时间差仍包含服务端发布、网络/TCP/TLS和回调前处理，不是精确的单程网络耗时；结合 `slow_ws_callback` 和网络循环停顿日志定位。
 
 24小时 ticker 只用于现货与永续成交额初筛。价格使用双方实时 bookTicker：
 
 每个统计周期只读取各市场当前最新的 bookTicker。所有腿的本机接收年龄和接收时间差都达标时，基差才进入均值、总体标准差和分位数统计；否则跳过本次采样。被拒绝的基差会与2秒内出现的下一条合格基差进行复核，变化至少3bp时限频写入 `data/diagnostics/basis_recheck.jsonl`。
 
-跨市场对齐使用网络线程中完整 WebSocket 消息解帧完成时记录的 `time.monotonic()` 时间，解析及快照传递时不重新打时间戳。现货没有交易所事件时间，不再借用ticker心跳或订阅额外ticker。永续另使用自身的 `E` 检查传输延迟，超过 `max_transport_lag_ms` 时独立重连；此检查要求本机系统时间准确。现货的本机接收时间不能证明其交易所侧生成时间。
+跨市场对齐使用网络线程中完整 WebSocket 消息解帧完成时记录的 `time.monotonic()` 时间，解析及快照传递时不重新打时间戳。现货没有交易所事件时间，不再借用ticker心跳或订阅额外ticker。永续使用自身 `E` 与REST校时后的接收时刻检查延迟，严格按 `max_transport_lag_ms` 丢弃超限消息，不用RTT放宽该阈值；RTT仍用于衡量对时质量。现货的本机接收时间不能证明其交易所侧生成时间。
+
+接收层丢弃记录为 `ingress_drop`，每连接最多每秒记录一次，`transport_lag` 计数仍逐条累积；持续失效重连记录为 `connection_lag_abort`，包含实际持续秒数与重连门槛。完整JSON解析后及采样前的时效、双腿时差检查继续保留。
+
+终端隐藏BBO连接的 `TransportLagError` 恢复提示，相关重连和丢弃仍写诊断日志；其他错误仍显示。当前资费保留最后一次收到的值，不因超过10秒或连接重连改为 `--`；从未收到该标的资费时才显示 `--`。资金费率页面更新时间仍显示该值的实际年龄。
 
 ```text
 spot_mid = (spot_bid + spot_ask) / 2
@@ -98,7 +118,8 @@ spread_bps = (USDC永续折算价 / USDT永续mid - 1) × 10000
   "stale_seconds": 10.0,
   "quote_max_age_ms": 1000,
   "quote_match_tolerance_ms": 200,
-  "max_transport_lag_ms": 2000,
+  "max_transport_lag_ms": 3000,
+  "bbo_invalid_reconnect_seconds": 10,
   "persist_interval_seconds": 60.0,
   "quantile_refresh_seconds": 15.0,
   "background_write_queue_size": 10000,
@@ -126,7 +147,7 @@ spread_bps = (USDC永续折算价 / USDT永续mid - 1) × 10000
 
 当前资金费率来自全市场标记价格WebSocket并覆盖内存中的最新值；30日均值、正负均值、分位数、方向一致率和当前方向持续时间只使用REST接口返回的已结算资金费率。不同结算周期统一折算为 `bp/8h`。资金费率历史只为通过公共成交额与价格初筛的永续标的在后台加载，不占用BBO网络线程。基差页面显示当前资费和30日均资费；永续－永续页面显示USDC永续减USDT永续的资费差。
 
-接收链路回归测试：`python -m unittest test_main test_network -v`。`test_network.py` 使用真实本地WebSocket服务，覆盖同symbol覆盖100次仅解析最后一条、最新消息、分片重组、Ping/Pong、远端关闭、E超限重连，以及主线程暂停时网络仍更新；不是Binance现场网络压测。
+接收链路回归测试：`python -m unittest test_main test_network test_clock_sync -v`。测试覆盖超限消息在完整JSON解析前丢弃且不覆盖有效槽位、3000ms边界、单条迟到后同连接恢复、持续失效重连、分片重组、Ping/Pong，以及主线程暂停时网络仍更新；不是Binance现场网络压测。
 
 ## 按交易对持久化
 
