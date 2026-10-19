@@ -287,7 +287,13 @@ class MarketState:
             return routes
         pairings = [(asset, asset) for asset in filters.quote_assets]
         pairings.extend(tuple(pair) for pair in filters.cross_quote_pairings)
-        for spot_base, futures_base in self.tradfi_config.mappings.items():
+        mappings = {}
+        for symbol in list(self.spot_volumes):
+            parsed = self._split_symbol(symbol)
+            if parsed and len(parsed[0]) > 1 and parsed[0].endswith("B"):
+                mappings[parsed[0]] = parsed[0][:-1]
+        mappings.update(self.tradfi_config.mappings)
+        for spot_base, futures_base in mappings.items():
             for spot_quote, futures_quote in pairings:
                 spot = spot_base + spot_quote
                 futures = futures_base + futures_quote
@@ -405,11 +411,12 @@ class MarketState:
         return any(symbol.endswith(asset) for asset in self.quote_assets)
 
     def liquid_routes(self, filters: FilterConfig) -> dict[str, PairRoute]:
+        thresholds = self.tradfi_config if self.market_type == "tradfi" else filters
         return {
             key: route
             for key, route in self.pair_routes(filters).items()
-            if self.spot_volumes[route.spot_symbol].quote_volume >= filters.min_spot_volume
-            and self.futures_volumes[route.futures_symbol].quote_volume >= filters.min_futures_volume
+            if self.spot_volumes[route.spot_symbol].quote_volume >= thresholds.min_spot_volume
+            and self.futures_volumes[route.futures_symbol].quote_volume >= thresholds.min_futures_volume
         }
 
     def liquid_symbols(self, filters: FilterConfig) -> set[str]:
@@ -551,10 +558,11 @@ class MarketState:
         )
 
     def eligible_symbols(self, filters: FilterConfig) -> set[str]:
+        thresholds = self.tradfi_config if self.market_type == "tradfi" else filters
         return {
             key for key, route in self.liquid_routes(filters).items()
             if (spot := self.spot_books.get(route.spot_symbol)) is not None
-            and spot.mid > filters.min_spot_price
+            and spot.mid > thresholds.min_spot_price
             and self._conversion_rate(route) is not None
         }
 

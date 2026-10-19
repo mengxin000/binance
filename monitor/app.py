@@ -11,6 +11,7 @@ from typing import Any
 
 from .basis.core import (BackgroundWriter, BasisDiagnosticStore, LatestScreenWriter,
                          QuantileWorker, StatisticsEngine)
+from .basis.export import export_snapshot, write_snapshot
 from .models import MarketState
 from .funding.core import FundingHistoryWorker
 from .network.core import MarketNetworkWorker, monitor_loop_lag
@@ -101,6 +102,7 @@ async def run() -> None:
         asyncio.create_task(monitor_loop_lag(state, stop)),
     ]
     last_display = last_quantile = 0.0
+    last_export = time.monotonic()
     next_sample = time.monotonic()
     current_page = "spot_futures"
     try:
@@ -200,6 +202,16 @@ async def run() -> None:
                 disk_writer.submit(diagnostic_store.append_rows, diagnostic_rows, droppable=True)
             tradfi_engine.update(tradfi_snapshots, sample_interval, tradfi_stats_config, now_wall)
             quantile_worker.collect()
+            if now_mono - last_export >= 60:
+                payload = {
+                    "runtime_seconds": int(time.monotonic() - started_mono),
+                    **export_snapshot(state, engine, filters, stats_config),
+                }
+                payload["pairs"].extend(export_snapshot(
+                    tradfi_state, tradfi_engine, filters, tradfi_stats_config,
+                )["pairs"])
+                if disk_writer.submit(write_snapshot, data_root / "spot_futures.json", payload):
+                    last_export = now_mono
             if now_mono - last_quantile >= runtime.quantile_refresh_seconds:
                 jobs = [
                     (stats, stats_config) for stats in engine.pairs.values()

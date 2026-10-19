@@ -39,8 +39,15 @@ TRADFI_STATISTICS_CONFIG_PATH = CONFIG_DIR / "basis_tradfi.json"
 class TradFiConfig:
     enabled: bool = True
     mappings: dict[str, str] = field(default_factory=dict)
+    min_spot_volume: float = 1_000_000
+    min_futures_volume: float = 1_000_000
+    min_spot_price: float = 0.1
 
     def validate(self) -> None:
+        for name in ("min_spot_volume", "min_futures_volume", "min_spot_price"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < float("inf"):
+                raise ValueError(f"{name} 必须是非负有限数值")
         if not isinstance(self.enabled, bool):
             raise ValueError("enabled 必须是布尔值")
         if not isinstance(self.mappings, dict):

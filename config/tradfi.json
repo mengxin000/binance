@@ -1,5 +1,8 @@
 {
   "enabled": true,
+  "min_spot_volume": 1000000,
+  "min_futures_volume": 10000000,
+  "min_spot_price": 0.1,
   "mappings": {
     "QQQB": "QQQ",
     "XAUT": "XAU",

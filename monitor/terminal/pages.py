@@ -149,13 +149,14 @@ def render(
         f"初筛: {stats_config.sigma_multiplier:g}σ > {stats_config.min_k_sigma_bps:g}bp",
         f"开仓机会: 上穿 μ+{stats_config.open_threshold_bps:g}bp 后回落至 μ | "
         f"平仓机会: 下穿 μ{stats_config.close_threshold_bps:+g}bp 后回升至 μ",
-        f"市场准入: 现货中间价 > {filters.min_spot_price:g} USDT/USDC",
+        f"市场准入: 现货中间价 > {(state.tradfi_config.min_spot_price if state.market_type == 'tradfi' else filters.min_spot_price):g} USDT/USDC",
     ]
     for message in config_errors:
         lines.append(f"配置错误: {message}")
     if state.market_type == "tradfi":
         lines.append(f"映射表: {'开启' if state.tradfi_config.enabled else '关闭'} | "
-                     f"配置映射: {len(state.tradfi_config.mappings)} | 仅支持已确认价格单位一致的产品")
+                     f"现货去尾 B 自动匹配 | 手动映射: {len(state.tradfi_config.mappings)} | "
+                     f"成交额门槛: 现货 {state.tradfi_config.min_spot_volume:g} / 永续 {state.tradfi_config.min_futures_volume:g}")
         for spot_base, futures_base in state.tradfi_config.mappings.items():
             if not state.tradfi_config.enabled:
                 continue

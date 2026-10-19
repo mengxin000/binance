@@ -74,7 +74,7 @@ class TradFiTests(unittest.TestCase):
             path.write_text(json.dumps({"mappings": {}}), encoding="utf-8")
             self.assertTrue(manager.reload(force=True))
             self.state.tradfi_config = manager.current
-            self.assertFalse(self.state.tradfi_routes(self.filters))
+            self.assertTrue(self.state.tradfi_routes(self.filters))
             previous = manager.current
             path.write_text('{"mappings": {"qqqb": "QQQ"}}', encoding="utf-8")
             self.assertFalse(manager.reload(force=True))
@@ -96,10 +96,25 @@ class TradFiTests(unittest.TestCase):
     def test_missing_symbol_is_reported_without_subscribing(self):
         self.state.tradfi_config = TradFiConfig(mappings=mapping("MISSING", "QQQ"))
         view = self.state.tradfi_view()
-        self.assertFalse(view.pair_routes(self.filters))
+        self.assertTrue(view.pair_routes(self.filters))
         text = render(view, StatisticsEngine(), self.filters, StatisticsConfig(),
                       FundingConfig(), RuntimeConfig(), time.monotonic(), [])
         self.assertIn("映射待就绪: MISSING/QQQ", text)
+
+    def test_automatic_mapping_manual_override_and_independent_filters(self):
+        self.state.tradfi_config = TradFiConfig(mappings={})
+        self.state.spot_volumes["QQQBUSDT"].quote_volume = 2_000_000
+        self.state.futures_volumes["QQQUSDT"].quote_volume = 2_000_000
+        self.assertIn("QQQBUSDT", self.state.book_symbols("spot", self.filters))
+        view = self.state.tradfi_view()
+        self.assertIn("QQQBUSDT__QQQUSDT", view.eligible_symbols(self.filters))
+        self.state.tradfi_config = TradFiConfig(mappings={"QQQB": "BTC"})
+        routes = self.state.tradfi_routes(self.filters)
+        self.assertIn("QQQBUSDT__BTCUSDT", routes)
+        self.assertNotIn("QQQBUSDT__QQQUSDT", routes)
+        self.state.tradfi_config = TradFiConfig(min_spot_price=101)
+        self.assertFalse(self.state.tradfi_view().eligible_symbols(self.filters))
+        self.assertIn("BTCUSDT", self.state.eligible_symbols(self.filters))
 
     def test_unrelated_disconnect_does_not_freeze_any_page(self):
         self.state.book_connected = dict(spot=False, futures=False)
